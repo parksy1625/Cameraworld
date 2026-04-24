@@ -11,7 +11,6 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
@@ -343,20 +342,6 @@ class _LocalStore extends ChangeNotifier {
     job = null;
     await _persist();
     notifyListeners();
-  }
-}
-
-Future<Position?> _tryPosition() async {
-  try {
-    if (!await Geolocator.isLocationServiceEnabled()) return null;
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
-    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
-      return null;
-    }
-    return await Geolocator.getCurrentPosition();
-  } catch (_) {
-    return null;
   }
 }
 
@@ -692,7 +677,6 @@ class _UploadTabState extends State<_UploadTab> {
     });
     try {
       final captureId = await _ensureCapture();
-      final pos = await _tryPosition();
       final local = CamoState.instance.localMode;
       for (var i = 0; i < _items.length; i++) {
         final it = _items[i];
@@ -707,10 +691,6 @@ class _UploadTabState extends State<_UploadTab> {
             source: it.file,
             kind: it.kind,
             contentType: it.contentType,
-            lat: pos?.latitude,
-            lon: pos?.longitude,
-            altitude: pos?.altitude,
-            heading: pos?.heading,
           );
         } else {
           final filename = it.file.uri.pathSegments.last;
@@ -727,10 +707,6 @@ class _UploadTabState extends State<_UploadTab> {
             storageKey: storageKey,
             contentType: it.contentType,
             sizeBytes: await it.file.length(),
-            lat: pos?.latitude,
-            lon: pos?.longitude,
-            altitude: pos?.altitude,
-            heading: pos?.heading,
             capturedAt: DateTime.now().toUtc(),
           );
         }
