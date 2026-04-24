@@ -30,18 +30,28 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: "3.24.0"
+          flutter-version: "3.24.3"
           cache: true
 
-      - name: Show Flutter version
-        run: flutter --version
+      - name: Show Flutter + Dart version
+        run: |
+          flutter --version
+          dart --version
 
       # The repo only tracks `mobile/lib` + `mobile/pubspec.yaml`; Android
       # platform files are generated on every build so we never have to
       # hand-maintain gradle / manifest boilerplate.
+      #
+      # `flutter create` will happily overwrite our hand-authored pubspec,
+      # so we swap it out for the duration of scaffolding, then restore.
       - name: Generate Android platform files
         working-directory: mobile
-        run: flutter create --platforms=android --project-name camo --org app.camo .
+        run: |
+          set -eux
+          cp pubspec.yaml pubspec.yaml.bak
+          flutter create --platforms=android --project-name camo --org app.camo .
+          mv pubspec.yaml.bak pubspec.yaml
+          ls -la android/app/src/main/ || true
 
       - name: Fetch dependencies
         working-directory: mobile
@@ -49,7 +59,7 @@ jobs:
 
       - name: Build release APK
         working-directory: mobile
-        run: flutter build apk --release
+        run: flutter build apk --release --verbose
 
       # Installable APK — signed with the default Flutter debug key so it's
       # side-loadable without a keystore. For Play Store release add a
