@@ -21,6 +21,10 @@ void main() => runApp(const CamoApp());
 
 /// App-wide settings & active capture id. Single instance lives for the
 /// lifetime of the app; both tabs read/write it.
+///
+/// `lastSuccessJobId` is bumped whenever the Upload tab sees a job reach
+/// `succeeded`; the Map tab listens and reloads its WebView so the newly
+/// accumulated 3D map replaces whatever was on screen.
 class CamoState extends ChangeNotifier {
   static final instance = CamoState._();
   CamoState._();
@@ -30,6 +34,13 @@ class CamoState extends ChangeNotifier {
   String regionId = 'my-region';
   String userId = 'me';
   String? captureId;
+  String? lastSuccessJobId;
+
+  void markSuccess(String jobId) {
+    if (lastSuccessJobId == jobId) return;
+    lastSuccessJobId = jobId;
+    notifyListeners();
+  }
 
   static const _kApi = 'camo.apiBase';
   static const _kViewer = 'camo.viewerBase';
@@ -143,6 +154,12 @@ class _Api {
 
   Future<List<dynamic>> listJobs(String captureId) async {
     final r = await http.get(_u('/captures/$captureId/jobs'));
+    _ok(r, 200);
+    return jsonDecode(r.body) as List<dynamic>;
+  }
+
+  Future<List<dynamic>> listAssets(String captureId) async {
+    final r = await http.get(_u('/captures/$captureId/assets'));
     _ok(r, 200);
     return jsonDecode(r.body) as List<dynamic>;
   }
@@ -348,7 +365,72 @@ class _UploadTabState extends State<_UploadTab> {
   bool _busy = false;
   String _status = '';
 
+  // Cumulative state fetched from backend
+  int _accumulated = 0;
+  Map<String, dynamic>? _activeJob;
+  Timer? _jobPoll;
+
   _Api get _api => _Api(CamoState.instance.apiBase);
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshAccumulated();
+  }
+
+  @override
+  void dispose() {
+    _jobPoll?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refreshAccumulated() async {
+    final id = CamoState.instance.captureId;
+    if (id == null) {
+      setState(() => _accumulated = 0);
+      return;
+    }
+    try {
+      final assets = await _api.listAssets(id);
+      if (!mounted) return;
+      setState(() => _accumulated = assets.length);
+      await _refreshJob();
+    } catch (_) {
+      // Backend may be unreachable on first launch — ignore silently.
+    }
+  }
+
+  Future<void> _refreshJob() async {
+    final id = CamoState.instance.captureId;
+    if (id == null) return;
+    final jobs = await _api.listJobs(id);
+    final latest = jobs.isNotEmpty ? jobs.first as Map<String, dynamic> : null;
+    if (!mounted) return;
+    setState(() => _activeJob = latest);
+
+    if (latest != null) {
+      final status = latest['status'] as String;
+      if (status == 'queued' || status == 'running') {
+        _schedulePoll();
+      } else {
+        _jobPoll?.cancel();
+        if (status == 'succeeded') {
+          CamoState.instance.markSuccess(latest['id'] as String);
+        }
+      }
+    }
+  }
+
+  void _schedulePoll() {
+    _jobPoll?.cancel();
+    _jobPoll = Timer(const Duration(seconds: 3), () async {
+      try {
+        await _refreshJob();
+      } catch (_) {
+        _schedulePoll();
+      }
+    });
+  }
 
   Future<String> _ensureCapture() async {
     final s = CamoState.instance;
@@ -432,9 +514,13 @@ class _UploadTabState extends State<_UploadTab> {
           it.progress = 1.0;
         });
       }
-      setState(() => _status = 'All uploaded ✓');
+      setState(() {
+        _status = '업로드 완료';
+        _items.removeWhere((i) => i.uploaded);
+      });
+      await _refreshAccumulated();
     } catch (e) {
-      setState(() => _status = 'Error: $e');
+      setState(() => _status = '에러: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -443,18 +529,22 @@ class _UploadTabState extends State<_UploadTab> {
   Future<void> _submit() async {
     final captureId = CamoState.instance.captureId;
     if (captureId == null) {
-      setState(() => _status = 'Upload at least 5 files first');
+      setState(() => _status = '최소 5개 이상 업로드 후 다시 시도');
       return;
     }
     setState(() {
       _busy = true;
-      _status = 'Submitting for 3D reconstruction…';
+      _status = '3D 재구성 작업 생성 중…';
     });
     try {
       final job = await _api.submit(captureId);
-      setState(() => _status = 'Queued job ${job['id']} — check the 3D Map tab');
+      setState(() {
+        _activeJob = job;
+        _status = '작업 생성됨 — 누적 자산 $_accumulated개로 3D 지도 갱신';
+      });
+      _schedulePoll();
     } catch (e) {
-      setState(() => _status = 'Submit failed: $e');
+      setState(() => _status = '제출 실패: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -469,9 +559,13 @@ class _UploadTabState extends State<_UploadTab> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (captureId != null)
-            Text('Capture: ${captureId.substring(0, 8)}…',
-                style: const TextStyle(color: Colors.black54)),
+          _AccumulationBanner(
+            captureId: captureId,
+            accumulated: _accumulated,
+            queued: _items.length,
+          ),
+          const SizedBox(height: 8),
+          _JobProgress(job: _activeJob),
           const SizedBox(height: 8),
           Wrap(
             spacing: 8,
@@ -544,24 +638,30 @@ class _UploadTabState extends State<_UploadTab> {
                 child: FilledButton.icon(
                   onPressed: _busy || _items.isEmpty ? null : _uploadAll,
                   icon: const Icon(Icons.cloud_upload),
-                  label: Text('Upload ${_items.length - uploadedCount}'),
+                  label: Text('업로드 ${_items.length - uploadedCount}'),
                 ),
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: FilledButton.tonalIcon(
-                  onPressed: _busy || captureId == null || uploadedCount < 5 ? null : _submit,
+                  onPressed: _busy || captureId == null || _accumulated < 5
+                      ? null
+                      : _submit,
                   icon: const Icon(Icons.auto_awesome),
-                  label: const Text('Build 3D'),
+                  label: Text(_activeJob != null &&
+                          (_activeJob!['status'] == 'succeeded' ||
+                              _activeJob!['status'] == 'failed')
+                      ? '3D 재생성'
+                      : '3D 만들기'),
                 ),
               ),
             ],
           ),
-          if (uploadedCount < 5 && captureId != null)
+          if (_accumulated < 5 && captureId != null)
             const Padding(
               padding: EdgeInsets.only(top: 4),
               child: Text(
-                'Need ≥ 5 uploaded items before building.',
+                '누적 자산 5개 이상이면 3D 지도를 만들 수 있어요.',
                 style: TextStyle(color: Colors.black54, fontSize: 12),
               ),
             ),
@@ -595,26 +695,37 @@ class _MapTabState extends State<_MapTab> {
   String _status = '';
   bool _loading = false;
   Timer? _poll;
+  String? _loadedForSuccessId;
 
   _Api get _api => _Api(CamoState.instance.apiBase);
 
   @override
   void initState() {
     super.initState();
+    CamoState.instance.addListener(_onStateChange);
     _refresh();
   }
 
   @override
   void dispose() {
+    CamoState.instance.removeListener(_onStateChange);
     _poll?.cancel();
     super.dispose();
+  }
+
+  void _onStateChange() {
+    final successId = CamoState.instance.lastSuccessJobId;
+    if (successId != null && successId != _loadedForSuccessId) {
+      _loadedForSuccessId = successId;
+      _refresh();
+    }
   }
 
   Future<void> _refresh() async {
     final captureId = CamoState.instance.captureId;
     if (captureId == null) {
       setState(() {
-        _status = 'Upload something first on the Upload tab.';
+        _status = '업로드 탭에서 먼저 파일을 올려주세요.';
         _rec = null;
         _latestJob = null;
       });
@@ -629,18 +740,18 @@ class _MapTabState extends State<_MapTab> {
         _latestJob = latest;
         _rec = rec;
         if (rec != null) {
-          _status = 'Reconstruction ready.';
+          _status = '누적 3D 지도 준비됨';
           _loadViewer(captureId);
         } else if (latest != null) {
-          _status = 'Job ${latest['status']} '
-              '${latest['stage'] != null ? '(${latest['stage']})' : ''}';
+          final stage = latest['stage'];
+          _status = '작업 ${latest['status']}${stage != null ? ' · $stage' : ''}';
           _schedulePoll();
         } else {
-          _status = 'No job submitted yet.';
+          _status = '아직 생성된 3D 지도가 없어요.';
         }
       });
     } catch (e) {
-      setState(() => _status = 'Error: $e');
+      setState(() => _status = '에러: $e');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -653,7 +764,9 @@ class _MapTabState extends State<_MapTab> {
 
   void _loadViewer(String captureId) {
     final base = CamoState.instance.viewerBase;
-    final url = '$base/?capture=$captureId';
+    // Cache-bust so the viewer re-fetches after each new reconstruction.
+    final bust = DateTime.now().millisecondsSinceEpoch;
+    final url = '$base/?capture=$captureId&v=$bust';
     final controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(const Color(0x00000000))
@@ -675,7 +788,7 @@ class _MapTabState extends State<_MapTab> {
                 child: Text(
                   captureId == null
                       ? _status
-                      : 'Capture ${captureId.substring(0, 8)}… · $_status',
+                      : '캡처 ${captureId.substring(0, 8)}… · $_status',
                   style: const TextStyle(color: Colors.black87),
                 ),
               ),
@@ -720,9 +833,9 @@ class _NoMapPlaceholder extends StatelessWidget {
             const SizedBox(height: 12),
             Text(
               j == null
-                  ? 'No 3D reconstruction yet.\nUpload photos / videos and tap “Build 3D”.'
-                  : 'Reconstruction in progress.\nStatus: ${j['status']} '
-                      '${j['stage'] != null ? '(${j['stage']})' : ''}',
+                  ? '아직 3D 지도가 없어요.\n업로드 탭에서 파일을 올리고 "3D 만들기"를 눌러주세요.'
+                  : '3D 지도 생성 중…\n상태: ${j['status']}'
+                      '${j['stage'] != null ? ' · ${j['stage']}' : ''}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.black54),
             ),
@@ -730,10 +843,213 @@ class _NoMapPlaceholder extends StatelessWidget {
             OutlinedButton.icon(
               onPressed: onRetry,
               icon: const Icon(Icons.refresh),
-              label: const Text('Check again'),
+              label: const Text('다시 확인'),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ─── upload-tab helper widgets ───────────────────────────────────────────────
+
+class _AccumulationBanner extends StatelessWidget {
+  const _AccumulationBanner({
+    required this.captureId,
+    required this.accumulated,
+    required this.queued,
+  });
+  final String? captureId;
+  final int accumulated;
+  final int queued;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.primaryContainer;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.layers, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              captureId == null
+                  ? '첫 업로드를 올리면 캡처가 시작돼요.'
+                  : '누적 자산 $accumulated개 · 대기중 $queued개\n'
+                      '올릴수록 같은 캡처에 쌓여 3D 지도가 넓어져요.',
+              style: const TextStyle(fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+const List<(String id, String label)> _kStages = [
+  ('extract_frames', '프레임 추출'),
+  ('filter_quality', '품질 필터'),
+  ('colmap_sfm', '카메라 정합 (SfM)'),
+  ('colmap_mvs', '밀집 점군 (MVS)'),
+  ('gaussian_splat', 'Gaussian Splats'),
+  ('to_3dtiles', '3D 타일 변환'),
+];
+
+class _JobProgress extends StatelessWidget {
+  const _JobProgress({required this.job});
+  final Map<String, dynamic>? job;
+
+  @override
+  Widget build(BuildContext context) {
+    final j = job;
+    if (j == null) {
+      return const SizedBox.shrink();
+    }
+    final status = j['status'] as String;
+    final stage = j['stage'] as String?;
+    final error = j['error'] as String?;
+
+    if (status == 'succeeded') {
+      return _banner(
+        context,
+        color: Colors.green.shade100,
+        icon: Icons.check_circle,
+        iconColor: Colors.green.shade700,
+        title: '완료',
+        subtitle: '3D 지도가 업데이트됐어요. 2번째 탭에서 확인하세요.',
+      );
+    }
+    if (status == 'failed') {
+      return _banner(
+        context,
+        color: Colors.red.shade50,
+        icon: Icons.error_outline,
+        iconColor: Colors.red.shade700,
+        title: '실패',
+        subtitle: error ?? '알 수 없는 오류',
+      );
+    }
+
+    final currentIdx = _kStages.indexWhere((s) => s.$1 == stage);
+    final isQueued = status == 'queued' || currentIdx < 0;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blue.shade50,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                isQueued
+                    ? '대기 중…'
+                    : '진행 중: ${_kStages[currentIdx].$2}  '
+                        '(${currentIdx + 1}/${_kStages.length})',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (var i = 0; i < _kStages.length; i++)
+                _StageChip(
+                  label: _kStages[i].$2,
+                  state: i < currentIdx
+                      ? _StageState.done
+                      : i == currentIdx
+                          ? _StageState.active
+                          : _StageState.pending,
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _banner(
+    BuildContext context, {
+    required Color color,
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String subtitle,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: iconColor),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title,
+                    style:
+                        TextStyle(fontWeight: FontWeight.bold, color: iconColor)),
+                const SizedBox(height: 2),
+                Text(subtitle, style: const TextStyle(fontSize: 13)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+enum _StageState { pending, active, done }
+
+class _StageChip extends StatelessWidget {
+  const _StageChip({required this.label, required this.state});
+  final String label;
+  final _StageState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final (bg, fg, icon) = switch (state) {
+      _StageState.done => (Colors.green.shade600, Colors.white, Icons.check),
+      _StageState.active => (Colors.blue.shade700, Colors.white, Icons.play_arrow),
+      _StageState.pending => (Colors.grey.shade300, Colors.black54, Icons.circle_outlined),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: fg),
+          const SizedBox(width: 4),
+          Text(label, style: TextStyle(fontSize: 12, color: fg)),
+        ],
       ),
     );
   }
