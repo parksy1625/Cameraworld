@@ -1302,7 +1302,7 @@ class _AccumulationBanner extends StatelessWidget {
   }
 }
 
-const List<(String id, String label)> _kStages = [
+const List<(String, String)> _kStages = [
   ('extract_frames', '프레임 추출'),
   ('filter_quality', '품질 필터'),
   ('colmap_sfm', '카메라 정합 (SfM)'),
