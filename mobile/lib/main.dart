@@ -7,11 +7,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
@@ -35,6 +39,9 @@ class CamoState extends ChangeNotifier {
   String userId = 'me';
   String? captureId;
   String? lastSuccessJobId;
+  // Default to local mode so the app works out of the box on a phone
+  // with no backend reachable. Flip in Settings to use the real API.
+  bool localMode = true;
 
   void markSuccess(String jobId) {
     if (lastSuccessJobId == jobId) return;
@@ -47,6 +54,7 @@ class CamoState extends ChangeNotifier {
   static const _kRegion = 'camo.regionId';
   static const _kUser = 'camo.userId';
   static const _kCapture = 'camo.captureId';
+  static const _kLocal = 'camo.localMode';
 
   Future<void> load() async {
     final p = await SharedPreferences.getInstance();
@@ -55,6 +63,7 @@ class CamoState extends ChangeNotifier {
     regionId = p.getString(_kRegion) ?? regionId;
     userId = p.getString(_kUser) ?? userId;
     captureId = p.getString(_kCapture);
+    localMode = p.getBool(_kLocal) ?? true;
     notifyListeners();
   }
 
@@ -64,6 +73,7 @@ class CamoState extends ChangeNotifier {
     await p.setString(_kViewer, viewerBase);
     await p.setString(_kRegion, regionId);
     await p.setString(_kUser, userId);
+    await p.setBool(_kLocal, localMode);
     if (captureId != null) {
       await p.setString(_kCapture, captureId!);
     } else {
@@ -178,6 +188,164 @@ class _Api {
   }
 }
 
+// ─── local-mode backend ──────────────────────────────────────────────────────
+//
+// A fully offline drop-in that mimics the shape of the REST API so the app can
+// run on a phone with no backend reachable. Assets are copied into the app's
+// documents directory; job progression is simulated with a timer stepping
+// through the same six stages as the real pipeline. Good enough for UI /
+// flow testing; the 3D "map" in Tab 2 is rendered natively in Flutter.
+
+class _LocalStore extends ChangeNotifier {
+  static final instance = _LocalStore._();
+  _LocalStore._();
+
+  static const _kAssets = 'camo.local.assets';
+  static const _kJob = 'camo.local.job';
+
+  final List<Map<String, dynamic>> assets = [];
+  Map<String, dynamic>? job;
+  Timer? _sim;
+  bool _loaded = false;
+
+  List<Map<String, dynamic>> assetsFor(String captureId) =>
+      assets.where((a) => a['capture_id'] == captureId).toList();
+
+  Future<void> load() async {
+    if (_loaded) return;
+    _loaded = true;
+    final sp = await SharedPreferences.getInstance();
+    final a = sp.getString(_kAssets);
+    if (a != null) {
+      final list = (jsonDecode(a) as List).cast<Map<String, dynamic>>();
+      assets
+        ..clear()
+        ..addAll(list);
+    }
+    final j = sp.getString(_kJob);
+    if (j != null) job = jsonDecode(j) as Map<String, dynamic>;
+    // If the app was killed mid-run, revive the simulation from the saved
+    // stage rather than stranding the user on a spinner.
+    if (job != null &&
+        (job!['status'] == 'queued' || job!['status'] == 'running')) {
+      _resumeSim();
+    }
+    notifyListeners();
+  }
+
+  Future<void> _persist() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(_kAssets, jsonEncode(assets));
+    if (job != null) {
+      await sp.setString(_kJob, jsonEncode(job));
+    } else {
+      await sp.remove(_kJob);
+    }
+  }
+
+  Future<String> addAsset({
+    required String captureId,
+    required File source,
+    required String kind,
+    required String contentType,
+    double? lat,
+    double? lon,
+    double? altitude,
+    double? heading,
+    DateTime? capturedAt,
+  }) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(docs.path, 'camo', captureId));
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    final ext = p.extension(source.path);
+    final dst = File(p.join(dir.path, '${id}_${p.basenameWithoutExtension(source.path)}$ext'));
+    await source.copy(dst.path);
+    final meta = <String, dynamic>{
+      'id': id,
+      'capture_id': captureId,
+      'kind': kind,
+      'content_type': contentType,
+      'storage_key': dst.path,
+      'size_bytes': await dst.length(),
+      'lat': lat,
+      'lon': lon,
+      'altitude': altitude,
+      'heading': heading,
+      'captured_at': (capturedAt ?? DateTime.now().toUtc()).toIso8601String(),
+    };
+    assets.add(meta);
+    await _persist();
+    notifyListeners();
+    return id;
+  }
+
+  Future<Map<String, dynamic>> submit(String captureId) async {
+    job = {
+      'id': 'local-${DateTime.now().millisecondsSinceEpoch}',
+      'capture_id': captureId,
+      'status': 'queued',
+      'stage': null,
+      'error': null,
+      'created_at': DateTime.now().toIso8601String(),
+      'started_at': null,
+      'finished_at': null,
+      '_stageIndex': -1,
+    };
+    await _persist();
+    notifyListeners();
+    _startSim();
+    return job!;
+  }
+
+  void _startSim() {
+    _sim?.cancel();
+    _tickLater();
+  }
+
+  void _resumeSim() => _tickLater();
+
+  void _tickLater() {
+    _sim = Timer(const Duration(milliseconds: 1500), _tickStage);
+  }
+
+  void _tickStage() {
+    if (job == null) return;
+    final idx = (job!['_stageIndex'] as int) + 1;
+    const stages = [
+      'extract_frames',
+      'filter_quality',
+      'colmap_sfm',
+      'colmap_mvs',
+      'gaussian_splat',
+      'to_3dtiles',
+    ];
+    if (idx >= stages.length) {
+      job!['status'] = 'succeeded';
+      job!['stage'] = null;
+      job!['finished_at'] = DateTime.now().toIso8601String();
+    } else {
+      job!['status'] = 'running';
+      job!['stage'] = stages[idx];
+      job!['_stageIndex'] = idx;
+      if (job!['started_at'] == null) {
+        job!['started_at'] = DateTime.now().toIso8601String();
+      }
+      _tickLater();
+    }
+    _persist();
+    notifyListeners();
+  }
+
+  Future<void> reset() async {
+    _sim?.cancel();
+    assets.clear();
+    job = null;
+    await _persist();
+    notifyListeners();
+  }
+}
+
 Future<Position?> _tryPosition() async {
   try {
     if (!await Geolocator.isLocationServiceEnabled()) return null;
@@ -220,7 +388,10 @@ class _CamoHomeState extends State<_CamoHome> {
   @override
   void initState() {
     super.initState();
-    CamoState.instance.load().then((_) {
+    Future.wait([
+      CamoState.instance.load(),
+      _LocalStore.instance.load(),
+    ]).then((_) {
       if (mounted) setState(() => _loaded = true);
     });
   }
@@ -276,6 +447,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   late final TextEditingController _viewer;
   late final TextEditingController _region;
   late final TextEditingController _user;
+  late bool _localMode;
 
   @override
   void initState() {
@@ -285,6 +457,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
     _viewer = TextEditingController(text: s.viewerBase);
     _region = TextEditingController(text: s.regionId);
     _user = TextEditingController(text: s.userId);
+    _localMode = s.localMode;
   }
 
   @override
@@ -307,6 +480,18 @@ class _SettingsSheetState extends State<_SettingsSheet> {
         children: [
           const Text('Settings', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('로컬 테스트 모드'),
+            subtitle: const Text(
+              '백엔드 없이 폰 안에서 전체 흐름을 시뮬레이션합니다. '
+              '3D 지도는 업로드한 사진으로 3D 링이 그려져요.',
+              style: TextStyle(fontSize: 12),
+            ),
+            value: _localMode,
+            onChanged: (v) => setState(() => _localMode = v),
+          ),
+          const SizedBox(height: 4),
           TextField(controller: _api, decoration: const InputDecoration(labelText: 'API base URL')),
           const SizedBox(height: 8),
           TextField(controller: _viewer, decoration: const InputDecoration(labelText: 'Viewer base URL')),
@@ -322,10 +507,12 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                   onPressed: () async {
                     final s = CamoState.instance;
                     s.captureId = null;
+                    s.lastSuccessJobId = null;
                     await s.save();
+                    await _LocalStore.instance.reset();
                     if (context.mounted) Navigator.pop(context);
                   },
-                  child: const Text('Reset capture'),
+                  child: const Text('캡처 초기화'),
                 ),
               ),
               const SizedBox(width: 12),
@@ -337,10 +524,11 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                     s.viewerBase = _viewer.text.trim();
                     s.regionId = _region.text.trim();
                     s.userId = _user.text.trim();
+                    s.localMode = _localMode;
                     await s.save();
                     if (context.mounted) Navigator.pop(context);
                   },
-                  child: const Text('Save'),
+                  child: const Text('저장'),
                 ),
               ),
             ],
@@ -375,13 +563,27 @@ class _UploadTabState extends State<_UploadTab> {
   @override
   void initState() {
     super.initState();
+    _LocalStore.instance.addListener(_onLocalChange);
+    CamoState.instance.addListener(_onStateChange);
     _refreshAccumulated();
   }
 
   @override
   void dispose() {
+    _LocalStore.instance.removeListener(_onLocalChange);
+    CamoState.instance.removeListener(_onStateChange);
     _jobPoll?.cancel();
     super.dispose();
+  }
+
+  void _onLocalChange() {
+    if (!CamoState.instance.localMode) return;
+    _refreshAccumulated();
+  }
+
+  void _onStateChange() {
+    // localMode flipped or captureId reset — recount.
+    _refreshAccumulated();
   }
 
   Future<void> _refreshAccumulated() async {
@@ -391,9 +593,11 @@ class _UploadTabState extends State<_UploadTab> {
       return;
     }
     try {
-      final assets = await _api.listAssets(id);
+      final count = CamoState.instance.localMode
+          ? _LocalStore.instance.assetsFor(id).length
+          : (await _api.listAssets(id)).length;
       if (!mounted) return;
-      setState(() => _accumulated = assets.length);
+      setState(() => _accumulated = count);
       await _refreshJob();
     } catch (_) {
       // Backend may be unreachable on first launch — ignore silently.
@@ -403,15 +607,20 @@ class _UploadTabState extends State<_UploadTab> {
   Future<void> _refreshJob() async {
     final id = CamoState.instance.captureId;
     if (id == null) return;
-    final jobs = await _api.listJobs(id);
-    final latest = jobs.isNotEmpty ? jobs.first as Map<String, dynamic> : null;
+    Map<String, dynamic>? latest;
+    if (CamoState.instance.localMode) {
+      latest = _LocalStore.instance.job;
+    } else {
+      final jobs = await _api.listJobs(id);
+      latest = jobs.isNotEmpty ? jobs.first as Map<String, dynamic> : null;
+    }
     if (!mounted) return;
     setState(() => _activeJob = latest);
 
     if (latest != null) {
       final status = latest['status'] as String;
       if (status == 'queued' || status == 'running') {
-        _schedulePoll();
+        if (!CamoState.instance.localMode) _schedulePoll();
       } else {
         _jobPoll?.cancel();
         if (status == 'succeeded') {
@@ -435,7 +644,9 @@ class _UploadTabState extends State<_UploadTab> {
   Future<String> _ensureCapture() async {
     final s = CamoState.instance;
     if (s.captureId != null) return s.captureId!;
-    final id = await _api.createCapture(regionId: s.regionId, userId: s.userId);
+    final id = s.localMode
+        ? 'local-${DateTime.now().millisecondsSinceEpoch}'
+        : await _api.createCapture(regionId: s.regionId, userId: s.userId);
     s.captureId = id;
     await s.save();
     return id;
@@ -482,33 +693,47 @@ class _UploadTabState extends State<_UploadTab> {
     try {
       final captureId = await _ensureCapture();
       final pos = await _tryPosition();
+      final local = CamoState.instance.localMode;
       for (var i = 0; i < _items.length; i++) {
         final it = _items[i];
         if (it.uploaded) continue;
         setState(() {
-          _status = 'Uploading ${i + 1}/${_items.length}…';
+          _status = '업로드 중 ${i + 1}/${_items.length}…';
           it.progress = 0.01;
         });
-        final filename = it.file.uri.pathSegments.last;
-        final (storageKey, uploadUrl) = await _api.presign(
-          captureId: captureId,
-          kind: it.kind,
-          contentType: it.contentType,
-          filename: filename,
-        );
-        await _api.putToPresigned(uploadUrl, it.file, it.contentType);
-        await _api.registerAsset(
-          captureId: captureId,
-          kind: it.kind,
-          storageKey: storageKey,
-          contentType: it.contentType,
-          sizeBytes: await it.file.length(),
-          lat: pos?.latitude,
-          lon: pos?.longitude,
-          altitude: pos?.altitude,
-          heading: pos?.heading,
-          capturedAt: DateTime.now().toUtc(),
-        );
+        if (local) {
+          await _LocalStore.instance.addAsset(
+            captureId: captureId,
+            source: it.file,
+            kind: it.kind,
+            contentType: it.contentType,
+            lat: pos?.latitude,
+            lon: pos?.longitude,
+            altitude: pos?.altitude,
+            heading: pos?.heading,
+          );
+        } else {
+          final filename = it.file.uri.pathSegments.last;
+          final (storageKey, uploadUrl) = await _api.presign(
+            captureId: captureId,
+            kind: it.kind,
+            contentType: it.contentType,
+            filename: filename,
+          );
+          await _api.putToPresigned(uploadUrl, it.file, it.contentType);
+          await _api.registerAsset(
+            captureId: captureId,
+            kind: it.kind,
+            storageKey: storageKey,
+            contentType: it.contentType,
+            sizeBytes: await it.file.length(),
+            lat: pos?.latitude,
+            lon: pos?.longitude,
+            altitude: pos?.altitude,
+            heading: pos?.heading,
+            capturedAt: DateTime.now().toUtc(),
+          );
+        }
         setState(() {
           it.uploaded = true;
           it.progress = 1.0;
@@ -537,7 +762,9 @@ class _UploadTabState extends State<_UploadTab> {
       _status = '3D 재구성 작업 생성 중…';
     });
     try {
-      final job = await _api.submit(captureId);
+      final job = CamoState.instance.localMode
+          ? await _LocalStore.instance.submit(captureId)
+          : await _api.submit(captureId);
       setState(() {
         _activeJob = job;
         _status = '작업 생성됨 — 누적 자산 $_accumulated개로 3D 지도 갱신';
@@ -703,14 +930,20 @@ class _MapTabState extends State<_MapTab> {
   void initState() {
     super.initState();
     CamoState.instance.addListener(_onStateChange);
+    _LocalStore.instance.addListener(_onLocal);
     _refresh();
   }
 
   @override
   void dispose() {
     CamoState.instance.removeListener(_onStateChange);
+    _LocalStore.instance.removeListener(_onLocal);
     _poll?.cancel();
     super.dispose();
+  }
+
+  void _onLocal() {
+    if (CamoState.instance.localMode) _refresh();
   }
 
   void _onStateChange() {
@@ -733,15 +966,28 @@ class _MapTabState extends State<_MapTab> {
     }
     setState(() => _loading = true);
     try {
-      final jobs = await _api.listJobs(captureId);
-      final latest = jobs.isNotEmpty ? jobs.first as Map<String, dynamic> : null;
-      final rec = await _api.reconstruction(captureId);
+      Map<String, dynamic>? latest;
+      Map<String, dynamic>? rec;
+      if (CamoState.instance.localMode) {
+        latest = _LocalStore.instance.job;
+        if (latest != null && latest['status'] == 'succeeded') {
+          rec = {'capture_id': captureId, 'local': true};
+        }
+      } else {
+        final jobs = await _api.listJobs(captureId);
+        latest = jobs.isNotEmpty ? jobs.first as Map<String, dynamic> : null;
+        rec = await _api.reconstruction(captureId);
+      }
       setState(() {
         _latestJob = latest;
         _rec = rec;
         if (rec != null) {
           _status = '누적 3D 지도 준비됨';
-          _loadViewer(captureId);
+          if (!CamoState.instance.localMode) {
+            _loadViewer(captureId);
+          } else {
+            _web = null;
+          }
         } else if (latest != null) {
           final stage = latest['stage'];
           _status = '작업 ${latest['status']}${stage != null ? ' · $stage' : ''}';
@@ -760,6 +1006,18 @@ class _MapTabState extends State<_MapTab> {
   void _schedulePoll() {
     _poll?.cancel();
     _poll = Timer(const Duration(seconds: 5), _refresh);
+  }
+
+  Widget _buildBody(String? captureId) {
+    if (_rec == null) {
+      return _NoMapPlaceholder(job: _latestJob, onRetry: _refresh);
+    }
+    if (CamoState.instance.localMode && captureId != null) {
+      final assets = _LocalStore.instance.assetsFor(captureId);
+      return _LocalMap3D(assets: assets);
+    }
+    if (_web != null) return WebViewWidget(controller: _web!);
+    return _NoMapPlaceholder(job: _latestJob, onRetry: _refresh);
   }
 
   void _loadViewer(String captureId) {
@@ -803,12 +1061,7 @@ class _MapTabState extends State<_MapTab> {
           ),
         ),
         Expanded(
-          child: _rec == null || _web == null
-              ? _NoMapPlaceholder(
-                  job: _latestJob,
-                  onRetry: _refresh,
-                )
-              : WebViewWidget(controller: _web!),
+          child: _buildBody(captureId),
         ),
       ],
     );
@@ -846,6 +1099,162 @@ class _NoMapPlaceholder extends StatelessWidget {
               label: const Text('다시 확인'),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── local 3D map (offline test view) ────────────────────────────────────────
+
+class _LocalMap3D extends StatefulWidget {
+  const _LocalMap3D({required this.assets});
+  final List<Map<String, dynamic>> assets;
+
+  @override
+  State<_LocalMap3D> createState() => _LocalMap3DState();
+}
+
+class _LocalMap3DState extends State<_LocalMap3D> with SingleTickerProviderStateMixin {
+  double _yaw = 0;
+  double _pitch = -0.15;
+  late final Ticker _tick;
+  bool _autoSpin = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick = createTicker((_) {
+      if (_autoSpin && mounted) setState(() => _yaw += 0.003);
+    })
+      ..start();
+  }
+
+  @override
+  void dispose() {
+    _tick.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final n = widget.assets.length;
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF0d1b2a), Color(0xFF1b2a41), Color(0xFF2a4365)],
+        ),
+      ),
+      child: GestureDetector(
+        onPanStart: (_) => _autoSpin = false,
+        onPanUpdate: (d) {
+          setState(() {
+            _yaw += d.delta.dx * 0.01;
+            _pitch = (_pitch + d.delta.dy * 0.005).clamp(-1.2, 0.3);
+          });
+        },
+        onDoubleTap: () => setState(() => _autoSpin = !_autoSpin),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _floor(),
+            for (var i = 0; i < n; i++) _photo(i, n, widget.assets[i]),
+            Positioned(
+              left: 12,
+              bottom: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  '누적 $n장 · 드래그 회전 · 더블탭으로 자동회전',
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _floor() {
+    final m = Matrix4.identity()
+      ..setEntry(3, 2, 0.0015)
+      ..rotateX(_pitch)
+      ..rotateY(_yaw)
+      ..translate(0.0, 140.0, 0.0)
+      ..rotateX(-math.pi / 2);
+    return Center(
+      child: Transform(
+        alignment: Alignment.center,
+        transform: m,
+        child: Container(
+          width: 700,
+          height: 700,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                Colors.tealAccent.withOpacity(0.25),
+                Colors.transparent,
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _photo(int i, int n, Map<String, dynamic> a) {
+    final theta = 2 * math.pi * i / math.max(n, 1);
+    final radius = 160 + n * 4.0;
+    final x = radius * math.cos(theta);
+    final z = radius * math.sin(theta);
+
+    final m = Matrix4.identity()
+      ..setEntry(3, 2, 0.0015)
+      ..rotateX(_pitch)
+      ..rotateY(_yaw)
+      ..translate(x, 0.0, z)
+      ..rotateY(-theta - math.pi / 2);
+
+    final isVideo = a['kind'] == 'video';
+    final path = a['storage_key'] as String?;
+    return Center(
+      child: Transform(
+        alignment: Alignment.center,
+        transform: m,
+        child: Container(
+          width: 120,
+          height: 160,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: Colors.tealAccent, width: 2),
+            boxShadow: const [
+              BoxShadow(color: Colors.black54, blurRadius: 10, offset: Offset(0, 4)),
+            ],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: isVideo || path == null
+              ? Container(
+                  color: Colors.black87,
+                  alignment: Alignment.center,
+                  child: const Icon(Icons.movie, color: Colors.white, size: 36),
+                )
+              : Image.file(
+                  File(path),
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => const ColoredBox(
+                    color: Colors.black26,
+                    child: Icon(Icons.broken_image, color: Colors.white54),
+                  ),
+                ),
         ),
       ),
     );
