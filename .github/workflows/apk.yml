@@ -57,29 +57,35 @@ jobs:
         working-directory: mobile
         run: flutter pub get
 
-      # MiDaS small TFLite → real semantic depth in local mode. Optional:
-      # if every mirror is down the app falls back to classical pseudo-depth,
-      # so we don't fail the build when the download misses.
-      - name: Download MiDaS TFLite model
+      # Depth Anything v2 Small TFLite → real semantic depth in local mode.
+      # Bundled into the APK when a mirror resolves. Misses are tolerated:
+      # the app falls back to classical pseudo-depth, and Base is fetched at
+      # runtime on first launch regardless.
+      - name: Download Depth Anything v2 Small TFLite
         working-directory: mobile
         continue-on-error: true
         run: |
           set -x
           mkdir -p assets/models
+          dst="assets/models/depth_anything_v2_small.tflite"
           urls=(
-            "https://github.com/PINTO0309/PINTO_model_zoo/raw/main/153_MiDaS_small/saved_model_midas_small_256x256/model_float16_quant.tflite"
-            "https://huggingface.co/Intel/MiDaS-small/resolve/main/midas_v2_1_small_256x256.tflite"
-            "https://storage.googleapis.com/tfhub-lite-models/intel/lite-model/midas/v2_1_small/1/lite/1.tflite"
+            "https://github.com/parksy1625/Cameraworld/releases/download/models/depth_anything_v2_small.tflite"
+            "https://huggingface.co/litert-community/depth-anything-v2-small/resolve/main/depth_anything_v2_small.tflite"
+            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/depth_anything_v2_small.tflite"
+            "https://github.com/PINTO0309/PINTO_model_zoo/releases/download/TFLite/depth_anything_v2_small_fp16.tflite"
           )
           for u in "${urls[@]}"; do
             echo "trying: $u"
-            if curl -fL --retry 2 --max-time 60 -o assets/models/midas.tflite "$u"; then
-              ls -la assets/models/midas.tflite && break
+            if curl -fL --retry 2 --max-time 120 -o "$dst" "$u"; then
+              sz=$(stat -c %s "$dst" 2>/dev/null || wc -c <"$dst")
+              if [ "$sz" -gt 1048576 ]; then   # must be > 1MB to be real
+                ls -la "$dst" && break
+              fi
             fi
-            rm -f assets/models/midas.tflite
+            rm -f "$dst"
           done
-          if [ ! -f assets/models/midas.tflite ]; then
-            echo "::warning::MiDaS model not available — app will fall back to classical depth"
+          if [ ! -f "$dst" ]; then
+            echo "::warning::Depth Anything v2 Small not bundled — classical fallback will be used until runtime download"
           fi
 
       - name: Analyze (non-blocking)

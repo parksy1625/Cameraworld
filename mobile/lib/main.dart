@@ -231,6 +231,105 @@ class _DepthMap {
   final Uint8List rgb;     // length w*h*3
 }
 
+// ─── model downloader ────────────────────────────────────────────────────────
+//
+// The APK ships with Depth Anything v2 Small (~25MB) — good quality, small
+// size. On first launch we try to fetch the Base model (~100MB) in the
+// background and cache it under the app's documents dir. If that succeeds
+// the engine picker upgrades automatically on the next submit.
+//
+// Network failure is non-fatal: we keep the Small model. A re-try is
+// available from the Settings sheet.
+
+enum _ModelDownloadState { idle, downloading, done, failed }
+
+class _ModelDownloader extends ChangeNotifier {
+  static final instance = _ModelDownloader._();
+  _ModelDownloader._();
+
+  // Candidate URLs for Depth Anything v2 Base TFLite. First hit wins.
+  // Order matters: user-pinned releases first (most reliable), then
+  // community mirrors. Failures cascade to the next entry.
+  static const List<String> baseUrls = [
+    // User-pinned fallback — set this to a release asset in your own repo
+    // for a guaranteed download path. Overrideable via settings later.
+    'https://github.com/parksy1625/Cameraworld/releases/download/models/depth_anything_v2_base.tflite',
+    // HuggingFace litert-community mirror (if the model lands there).
+    'https://huggingface.co/litert-community/depth-anything-v2-base/resolve/main/depth_anything_v2_base.tflite',
+  ];
+
+  _ModelDownloadState state = _ModelDownloadState.idle;
+  double progress = 0;
+  String? error;
+
+  static Future<File> baseFile() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(docs.path, 'models'));
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return File(p.join(dir.path, 'depth_anything_v2_base.tflite'));
+  }
+
+  Future<void> ensureDownloaded({bool force = false}) async {
+    if (state == _ModelDownloadState.downloading) return;
+    final f = await baseFile();
+    if (!force && f.existsSync() && await f.length() > 1024) {
+      state = _ModelDownloadState.done;
+      progress = 1.0;
+      notifyListeners();
+      return;
+    }
+    state = _ModelDownloadState.downloading;
+    progress = 0;
+    error = null;
+    notifyListeners();
+
+    for (final url in baseUrls) {
+      try {
+        debugPrint('camo: trying base model from $url');
+        final req = http.Request('GET', Uri.parse(url));
+        final resp = await http.Client().send(req).timeout(const Duration(seconds: 30));
+        if (resp.statusCode != 200) {
+          debugPrint('camo: $url → ${resp.statusCode}');
+          continue;
+        }
+        final total = resp.contentLength ?? 0;
+        var received = 0;
+        final tmp = File('${f.path}.part');
+        final sink = tmp.openWrite();
+        await for (final chunk in resp.stream) {
+          sink.add(chunk);
+          received += chunk.length;
+          if (total > 0) {
+            progress = received / total;
+            notifyListeners();
+          }
+        }
+        await sink.close();
+        await tmp.rename(f.path);
+        state = _ModelDownloadState.done;
+        progress = 1.0;
+        notifyListeners();
+        debugPrint('camo: base model saved (${received ~/ 1024} KB)');
+        return;
+      } catch (e) {
+        debugPrint('camo: base download failed from $url: $e');
+      }
+    }
+
+    state = _ModelDownloadState.failed;
+    error = 'All mirrors failed';
+    notifyListeners();
+  }
+
+  Future<void> deleteCache() async {
+    final f = await baseFile();
+    if (f.existsSync()) await f.delete();
+    state = _ModelDownloadState.idle;
+    progress = 0;
+    notifyListeners();
+  }
+}
+
 abstract class _DepthEngine {
   /// Produce a depth map + downsampled rgb from an image file.
   Future<_DepthMap?> analyzeFile(String path, {int target = 128});
@@ -238,11 +337,33 @@ abstract class _DepthEngine {
   /// Human-readable name for UI/status.
   String get name;
 
-  /// Pick Midas when a bundled model is available; classical otherwise.
-  /// Always succeeds — callers can assume a valid engine.
+  /// Pick the best available engine. Priority:
+  ///   1. Depth Anything v2 Base at-runtime file (downloaded on first launch).
+  ///   2. Depth Anything v2 Small bundled asset.
+  ///   3. Legacy MiDaS asset (older builds).
+  ///   4. Classical pseudo-depth — always available.
+  /// Always succeeds so callers don't need to null-check.
   static Future<_DepthEngine> forCurrent() async {
-    final midas = await _MidasEngine.tryLoad();
-    return midas ?? const _ClassicalEngine();
+    // 1) Downloaded Base
+    final baseFile = await _ModelDownloader.baseFile();
+    if (baseFile.existsSync() && await baseFile.length() > 1024) {
+      final e = await _TFLiteDepthEngine.fromFile(baseFile, label: 'depth-anything-v2-base');
+      if (e != null) return e;
+    }
+    // 2) Bundled Small
+    final small = await _TFLiteDepthEngine.fromAsset(
+      'assets/models/depth_anything_v2_small.tflite',
+      label: 'depth-anything-v2-small',
+    );
+    if (small != null) return small;
+    // 3) Legacy MiDaS
+    final midas = await _TFLiteDepthEngine.fromAsset(
+      'assets/models/midas.tflite',
+      label: 'midas',
+    );
+    if (midas != null) return midas;
+    // 4) Classical fallback
+    return const _ClassicalEngine();
   }
 }
 
@@ -262,30 +383,54 @@ class _DepthJob {
   final int target;
 }
 
-// ── MiDaS TFLite engine ────────────────────────────────────────────────────
-// Loads the bundled MiDaS small model (256x256 RGB in, 256x256 relative depth
-// out). Interpreter isn't thread-safe so inference runs on the main isolate;
-// for our scale (a handful of photos per submit) that's fine.
-class _MidasEngine implements _DepthEngine {
-  _MidasEngine._(this._interpreter, this._inDim);
+// ── TFLite depth engine (Depth Anything v2 / MiDaS / etc.) ─────────────────
+// Loads any single-channel-depth TFLite model. Handles variable input sizes
+// (256/308/518/...), applies ImageNet normalization used by Depth Anything
+// v2, and normalizes the output to [0,1] "near=1" convention used by the
+// rest of the pipeline.
+//
+// Interpreter isn't thread-safe so inference runs on the main isolate; for
+// our scale (a handful of photos per submit) that's fine.
+class _TFLiteDepthEngine implements _DepthEngine {
+  _TFLiteDepthEngine._(this._interpreter, this._inDim, this.name);
   final tfl.Interpreter _interpreter;
   final int _inDim;
-
   @override
-  String get name => 'midas';
+  final String name;
 
-  static Future<_MidasEngine?> tryLoad() async {
+  static Future<_TFLiteDepthEngine?> fromAsset(String asset, {required String label}) async {
     try {
-      final interp = await tfl.Interpreter.fromAsset('assets/models/midas.tflite');
-      // Input shape is typically [1, 256, 256, 3]; grab the spatial dim.
-      final shape = interp.getInputTensor(0).shape;
-      final dim = shape.length >= 3 ? shape[1] : 256;
-      debugPrint('camo: MiDaS ready (input ${shape.join('x')})');
-      return _MidasEngine._(interp, dim);
+      final interp = await tfl.Interpreter.fromAsset(asset);
+      return _make(interp, label);
     } catch (e) {
-      debugPrint('camo: MiDaS unavailable, falling back to classical ($e)');
+      debugPrint('camo: $label asset not loadable ($e)');
       return null;
     }
+  }
+
+  static Future<_TFLiteDepthEngine?> fromFile(File file, {required String label}) async {
+    try {
+      final interp = tfl.Interpreter.fromFile(file);
+      return _make(interp, label);
+    } catch (e) {
+      debugPrint('camo: $label file not loadable ($e)');
+      return null;
+    }
+  }
+
+  static _TFLiteDepthEngine _make(tfl.Interpreter interp, String label) {
+    final shape = interp.getInputTensor(0).shape;
+    // Accept [1, D, D, 3] (NHWC) or [1, 3, D, D] (NCHW, Depth Anything).
+    int dim;
+    if (shape.length == 4 && shape[1] == 3) {
+      dim = shape[2];
+    } else if (shape.length >= 3) {
+      dim = shape[1];
+    } else {
+      dim = 256;
+    }
+    debugPrint('camo: $label ready (input ${shape.join('x')}, dim=$dim)');
+    return _TFLiteDepthEngine._(interp, dim, label);
   }
 
   @override
@@ -296,48 +441,91 @@ class _MidasEngine implements _DepthEngine {
       if (src == null) return null;
       src = img.bakeOrientation(src);
 
-      // 1) Build MiDaS input tensor.
+      // Input tensor — try NHWC layout first (most common). If interpreter
+      // expects NCHW we re-layout below.
       final D = _inDim;
       final resized = img.copyResize(src, width: D, height: D,
           interpolation: img.Interpolation.linear);
-      final input = Float32List(D * D * 3);
+      final shape = _interpreter.getInputTensor(0).shape;
+      final isNchw = shape.length == 4 && shape[1] == 3;
+
+      // ImageNet normalization — matches Depth Anything v2 training.
+      const mean = [0.485, 0.456, 0.406];
+      const stdv = [0.229, 0.224, 0.225];
+      final input = Float32List(1 * 3 * D * D);
       for (var y = 0; y < D; y++) {
         for (var x = 0; x < D; x++) {
           final px = resized.getPixel(x, y);
-          final i = (y * D + x) * 3;
-          input[i] = px.r.toDouble() / 255.0;
-          input[i + 1] = px.g.toDouble() / 255.0;
-          input[i + 2] = px.b.toDouble() / 255.0;
+          final r = (px.r.toDouble() / 255.0 - mean[0]) / stdv[0];
+          final g = (px.g.toDouble() / 255.0 - mean[1]) / stdv[1];
+          final b = (px.b.toDouble() / 255.0 - mean[2]) / stdv[2];
+          if (isNchw) {
+            input[0 * D * D + y * D + x] = r;
+            input[1 * D * D + y * D + x] = g;
+            input[2 * D * D + y * D + x] = b;
+          } else {
+            final o = (y * D + x) * 3;
+            input[o] = r;
+            input[o + 1] = g;
+            input[o + 2] = b;
+          }
         }
       }
+      final inputTensor = isNchw ? input.reshape([1, 3, D, D]) : input.reshape([1, D, D, 3]);
 
-      // 2) Inference — [1,D,D,3] → [1,D,D] (relative inverse depth).
-      final inputTensor = input.reshape([1, D, D, 3]);
-      final outputTensor = List.generate(
-        1,
-        (_) => List.generate(D, (_) => List.filled(D, 0.0)),
-      );
+      // Output shape can be [1, D, D], [1, 1, D, D], or [1, D*D]. Build a
+      // buffer matching exactly what the model declares so tflite doesn't
+      // throw on mismatched ranks.
+      final outShape = _interpreter.getOutputTensor(0).shape;
+      final outFlat = Float32List(outShape.fold<int>(1, (a, b) => a * b));
+      dynamic outputTensor;
+      if (outShape.length == 4) {
+        outputTensor = List.generate(
+          outShape[0],
+          (_) => List.generate(outShape[1],
+              (_) => List.generate(outShape[2], (_) => List.filled(outShape[3], 0.0))),
+        );
+      } else if (outShape.length == 3) {
+        outputTensor = List.generate(outShape[0],
+            (_) => List.generate(outShape[1], (_) => List.filled(outShape[2], 0.0)));
+      } else {
+        outputTensor = [outFlat];
+      }
       _interpreter.run(inputTensor, outputTensor);
 
-      // 3) Downsample to target size + collect rgb from the resized input.
+      // Flatten output to a D×D float matrix, regardless of layout.
+      final flat = Float32List(D * D);
+      if (outputTensor is List && outputTensor.isNotEmpty) {
+        void walk(dynamic node, List<int> path) {
+          if (node is List) {
+            for (var i = 0; i < node.length; i++) {
+              walk(node[i], [...path, i]);
+            }
+          } else if (node is num) {
+            // Try to map the leaf into a D×D index.
+            final leafIdx = path.sublist(path.length - 2);
+            if (leafIdx.length == 2) {
+              final y = leafIdx[0], x = leafIdx[1];
+              if (y < D && x < D) flat[y * D + x] = node.toDouble();
+            }
+          }
+        }
+        walk(outputTensor, <int>[]);
+      }
+
+      double lo = double.infinity, hi = -double.infinity;
+      for (var v in flat) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      final span = (hi - lo).abs() < 1e-6 ? 1.0 : (hi - lo);
+
+      // Downsample to target grid + pull rgb from a separately resized copy.
       final small = img.copyResize(src, width: target, height: target,
           interpolation: img.Interpolation.linear);
       final w = small.width, h = small.height;
       final rgb = Uint8List(w * h * 3);
       final depth = Float32List(w * h);
-
-      // Normalize MiDaS output to [0,1]. Higher MiDaS value = closer, so we
-      // invert so "near → 1" lines up with the classical engine's convention.
-      double lo = double.infinity, hi = -double.infinity;
-      for (var y = 0; y < D; y++) {
-        for (var x = 0; x < D; x++) {
-          final v = outputTensor[0][y][x];
-          if (v < lo) lo = v;
-          if (v > hi) hi = v;
-        }
-      }
-      final span = (hi - lo).abs() < 1e-6 ? 1.0 : (hi - lo);
-
       for (var y = 0; y < h; y++) {
         for (var x = 0; x < w; x++) {
           final px = small.getPixel(x, y);
@@ -345,22 +533,18 @@ class _MidasEngine implements _DepthEngine {
           rgb[o * 3] = px.r.toInt();
           rgb[o * 3 + 1] = px.g.toInt();
           rgb[o * 3 + 2] = px.b.toInt();
-
-          // Nearest neighbor lookup into the MiDaS output grid.
           final mx = (x * D / w).floor().clamp(0, D - 1);
           final my = (y * D / h).floor().clamp(0, D - 1);
-          final raw = outputTensor[0][my][mx];
-          depth[o] = ((raw - lo) / span).clamp(0.0, 1.0);
+          depth[o] = ((flat[my * D + mx] - lo) / span).clamp(0.0, 1.0);
         }
       }
       return _DepthMap(w, h, depth, rgb);
     } catch (e, st) {
-      debugPrint('camo: MiDaS inference failed: $e\n$st');
+      debugPrint('camo: $name inference failed: $e\n$st');
       return null;
     }
   }
 }
-
 // Top-level function so it can run in an isolate via `compute`.
 _DepthMap? _depthIsolate(_DepthJob job) {
   final bytes = File(job.path).readAsBytesSync();
@@ -848,6 +1032,10 @@ class _CamoHomeState extends State<_CamoHome> {
       _LocalStore.instance.load(),
     ]).then((_) {
       if (mounted) setState(() => _loaded = true);
+      // Fire-and-forget: if the Base model isn't cached yet, pull it in
+      // the background. Progress is surfaced in the Settings sheet; the
+      // app remains fully usable on the bundled Small model meanwhile.
+      _ModelDownloader.instance.ensureDownloaded();
     });
   }
 
@@ -978,6 +1166,65 @@ class _SettingsSheetState extends State<_SettingsSheet> {
               '외부: 피사체 주위를 돌며 촬영 · 실내: 가운데 서서 둘러보며 촬영',
               style: TextStyle(fontSize: 11, color: Colors.black54),
             ),
+          ),
+          ListenableBuilder(
+            listenable: _ModelDownloader.instance,
+            builder: (_, __) {
+              final d = _ModelDownloader.instance;
+              String label;
+              Color color = Colors.black87;
+              Widget? trailing;
+              switch (d.state) {
+                case _ModelDownloadState.idle:
+                  label = '고화질 모델(Base) — 대기 중';
+                  trailing = TextButton(
+                    onPressed: () => d.ensureDownloaded(force: true),
+                    child: const Text('다운로드'),
+                  );
+                  break;
+                case _ModelDownloadState.downloading:
+                  final pct = (d.progress * 100).clamp(0, 100).toStringAsFixed(0);
+                  label = '고화질 모델(Base) 다운로드 중… $pct%';
+                  color = Colors.blue.shade700;
+                  trailing = SizedBox(
+                    width: 60,
+                    child: LinearProgressIndicator(
+                      value: d.progress == 0 ? null : d.progress,
+                      minHeight: 4,
+                    ),
+                  );
+                  break;
+                case _ModelDownloadState.done:
+                  label = '고화질 모델(Base) — 준비됨 ✓';
+                  color = Colors.green.shade700;
+                  trailing = TextButton(
+                    onPressed: () async {
+                      await d.deleteCache();
+                    },
+                    child: const Text('삭제'),
+                  );
+                  break;
+                case _ModelDownloadState.failed:
+                  label = '고화질 모델 받기 실패 — Small로 동작 중';
+                  color = Colors.orange.shade800;
+                  trailing = TextButton(
+                    onPressed: () => d.ensureDownloaded(force: true),
+                    child: const Text('다시 시도'),
+                  );
+                  break;
+              }
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(label, style: TextStyle(fontSize: 12, color: color)),
+                    ),
+                    if (trailing != null) trailing,
+                  ],
+                ),
+              );
+            },
           ),
           TextField(controller: _api, decoration: const InputDecoration(labelText: 'API base URL')),
           const SizedBox(height: 8),
