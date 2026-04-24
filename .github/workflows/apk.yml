@@ -57,6 +57,31 @@ jobs:
         working-directory: mobile
         run: flutter pub get
 
+      # MiDaS small TFLite → real semantic depth in local mode. Optional:
+      # if every mirror is down the app falls back to classical pseudo-depth,
+      # so we don't fail the build when the download misses.
+      - name: Download MiDaS TFLite model
+        working-directory: mobile
+        continue-on-error: true
+        run: |
+          set -x
+          mkdir -p assets/models
+          urls=(
+            "https://github.com/PINTO0309/PINTO_model_zoo/raw/main/153_MiDaS_small/saved_model_midas_small_256x256/model_float16_quant.tflite"
+            "https://huggingface.co/Intel/MiDaS-small/resolve/main/midas_v2_1_small_256x256.tflite"
+            "https://storage.googleapis.com/tfhub-lite-models/intel/lite-model/midas/v2_1_small/1/lite/1.tflite"
+          )
+          for u in "${urls[@]}"; do
+            echo "trying: $u"
+            if curl -fL --retry 2 --max-time 60 -o assets/models/midas.tflite "$u"; then
+              ls -la assets/models/midas.tflite && break
+            fi
+            rm -f assets/models/midas.tflite
+          done
+          if [ ! -f assets/models/midas.tflite ]; then
+            echo "::warning::MiDaS model not available — app will fall back to classical depth"
+          fi
+
       - name: Analyze (non-blocking)
         working-directory: mobile
         continue-on-error: true

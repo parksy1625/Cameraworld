@@ -18,12 +18,18 @@ import 'package:http/http.dart' as http;
 import 'package:exif/exif.dart' as exif_pkg;
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
+import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 void main() => runApp(const CamoApp());
+
+// Spatial arrangement used by the local point-cloud renderer.
+// * outdoor — camera circles the subject; tiles face inward.
+// * indoor  — viewer at the center; tiles wrap around a cylinder facing out.
+enum _LayoutMode { outdoor, indoor }
 
 // ─── shared state ────────────────────────────────────────────────────────────
 
@@ -46,6 +52,9 @@ class CamoState extends ChangeNotifier {
   // Default to local mode so the app works out of the box on a phone
   // with no backend reachable. Flip in Settings to use the real API.
   bool localMode = true;
+  // Controls how the local engine arranges per-image tiles in 3D space.
+  // outdoor → walk-around-subject ring; indoor → panorama cylinder.
+  _LayoutMode layoutMode = _LayoutMode.outdoor;
 
   void markSuccess(String jobId) {
     if (lastSuccessJobId == jobId) return;
@@ -59,6 +68,7 @@ class CamoState extends ChangeNotifier {
   static const _kUser = 'camo.userId';
   static const _kCapture = 'camo.captureId';
   static const _kLocal = 'camo.localMode';
+  static const _kLayout = 'camo.layoutMode';
 
   Future<void> load() async {
     final p = await SharedPreferences.getInstance();
@@ -68,6 +78,8 @@ class CamoState extends ChangeNotifier {
     userId = p.getString(_kUser) ?? userId;
     captureId = p.getString(_kCapture);
     localMode = p.getBool(_kLocal) ?? true;
+    final layout = p.getString(_kLayout);
+    layoutMode = layout == 'indoor' ? _LayoutMode.indoor : _LayoutMode.outdoor;
     notifyListeners();
   }
 
@@ -78,6 +90,7 @@ class CamoState extends ChangeNotifier {
     await p.setString(_kRegion, regionId);
     await p.setString(_kUser, userId);
     await p.setBool(_kLocal, localMode);
+    await p.setString(_kLayout, layoutMode == _LayoutMode.indoor ? 'indoor' : 'outdoor');
     if (captureId != null) {
       await p.setString(_kCapture, captureId!);
     } else {
@@ -218,12 +231,27 @@ class _DepthMap {
   final Uint8List rgb;     // length w*h*3
 }
 
-class _DepthEngine {
-  const _DepthEngine();
-
+abstract class _DepthEngine {
   /// Produce a depth map + downsampled rgb from an image file.
-  /// Runs entirely in-process; call via [compute] to offload to a worker.
-  Future<_DepthMap?> analyzeFile(String path, {int target = 96}) async {
+  Future<_DepthMap?> analyzeFile(String path, {int target = 128});
+
+  /// Human-readable name for UI/status.
+  String get name;
+
+  /// Pick Midas when a bundled model is available; classical otherwise.
+  /// Always succeeds — callers can assume a valid engine.
+  static Future<_DepthEngine> forCurrent() async {
+    final midas = await _MidasEngine.tryLoad();
+    return midas ?? const _ClassicalEngine();
+  }
+}
+
+class _ClassicalEngine implements _DepthEngine {
+  const _ClassicalEngine();
+  @override
+  String get name => 'classical';
+  @override
+  Future<_DepthMap?> analyzeFile(String path, {int target = 128}) async {
     return compute(_depthIsolate, _DepthJob(path, target));
   }
 }
@@ -232,6 +260,105 @@ class _DepthJob {
   const _DepthJob(this.path, this.target);
   final String path;
   final int target;
+}
+
+// ── MiDaS TFLite engine ────────────────────────────────────────────────────
+// Loads the bundled MiDaS small model (256x256 RGB in, 256x256 relative depth
+// out). Interpreter isn't thread-safe so inference runs on the main isolate;
+// for our scale (a handful of photos per submit) that's fine.
+class _MidasEngine implements _DepthEngine {
+  _MidasEngine._(this._interpreter, this._inDim);
+  final tfl.Interpreter _interpreter;
+  final int _inDim;
+
+  @override
+  String get name => 'midas';
+
+  static Future<_MidasEngine?> tryLoad() async {
+    try {
+      final interp = await tfl.Interpreter.fromAsset('assets/models/midas.tflite');
+      // Input shape is typically [1, 256, 256, 3]; grab the spatial dim.
+      final shape = interp.getInputTensor(0).shape;
+      final dim = shape.length >= 3 ? shape[1] : 256;
+      debugPrint('camo: MiDaS ready (input ${shape.join('x')})');
+      return _MidasEngine._(interp, dim);
+    } catch (e) {
+      debugPrint('camo: MiDaS unavailable, falling back to classical ($e)');
+      return null;
+    }
+  }
+
+  @override
+  Future<_DepthMap?> analyzeFile(String path, {int target = 128}) async {
+    try {
+      final bytes = await File(path).readAsBytes();
+      img.Image? src = img.decodeImage(bytes);
+      if (src == null) return null;
+      src = img.bakeOrientation(src);
+
+      // 1) Build MiDaS input tensor.
+      final D = _inDim;
+      final resized = img.copyResize(src, width: D, height: D,
+          interpolation: img.Interpolation.linear);
+      final input = Float32List(D * D * 3);
+      for (var y = 0; y < D; y++) {
+        for (var x = 0; x < D; x++) {
+          final px = resized.getPixel(x, y);
+          final i = (y * D + x) * 3;
+          input[i] = px.r.toDouble() / 255.0;
+          input[i + 1] = px.g.toDouble() / 255.0;
+          input[i + 2] = px.b.toDouble() / 255.0;
+        }
+      }
+
+      // 2) Inference — [1,D,D,3] → [1,D,D] (relative inverse depth).
+      final inputTensor = input.reshape([1, D, D, 3]);
+      final outputTensor = List.generate(
+        1,
+        (_) => List.generate(D, (_) => List.filled(D, 0.0)),
+      );
+      _interpreter.run(inputTensor, outputTensor);
+
+      // 3) Downsample to target size + collect rgb from the resized input.
+      final small = img.copyResize(src, width: target, height: target,
+          interpolation: img.Interpolation.linear);
+      final w = small.width, h = small.height;
+      final rgb = Uint8List(w * h * 3);
+      final depth = Float32List(w * h);
+
+      // Normalize MiDaS output to [0,1]. Higher MiDaS value = closer, so we
+      // invert so "near → 1" lines up with the classical engine's convention.
+      double lo = double.infinity, hi = -double.infinity;
+      for (var y = 0; y < D; y++) {
+        for (var x = 0; x < D; x++) {
+          final v = outputTensor[0][y][x];
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+      }
+      final span = (hi - lo).abs() < 1e-6 ? 1.0 : (hi - lo);
+
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          final px = small.getPixel(x, y);
+          final o = (y * w + x);
+          rgb[o * 3] = px.r.toInt();
+          rgb[o * 3 + 1] = px.g.toInt();
+          rgb[o * 3 + 2] = px.b.toInt();
+
+          // Nearest neighbor lookup into the MiDaS output grid.
+          final mx = (x * D / w).floor().clamp(0, D - 1);
+          final my = (y * D / h).floor().clamp(0, D - 1);
+          final raw = outputTensor[0][my][mx];
+          depth[o] = ((raw - lo) / span).clamp(0.0, 1.0);
+        }
+      }
+      return _DepthMap(w, h, depth, rgb);
+    } catch (e, st) {
+      debugPrint('camo: MiDaS inference failed: $e\n$st');
+      return null;
+    }
+  }
 }
 
 // Top-level function so it can run in an isolate via `compute`.
@@ -328,52 +455,87 @@ class _PointCloudStore {
     required String captureId,
     required _DepthMap depth,
     required int imageIndex,
-    int stride = 2,
+    required int totalImages,
+    int stride = 1,
+    _LayoutMode mode = _LayoutMode.outdoor,
   }) async {
     final w = depth.w, h = depth.h;
-    final samples = ((w ~/ stride) * (h ~/ stride));
+    final samples = ((w / stride).floor() * (h / stride).floor());
     final out = Float32List(samples * 6);
     var k = 0;
 
-    // Place this image's tile at an offset on a ring around the origin.
-    final theta = imageIndex * (math.pi / 3); // 60° apart, wraps naturally
-    final cosT = math.cos(theta), sinT = math.sin(theta);
-    final radius = 1.8;
-    final centerX = radius * cosT;
-    final centerZ = radius * sinT;
-
-    // Camera intrinsics for back-projection — simple focal length assumption.
+    // Back-projection intrinsics for both modes.
     final cx = w / 2.0;
     final cy = h / 2.0;
     final f = w.toDouble(); // ~60° FOV
-    final tileScale = 0.75;  // tile half-width in world units
 
-    for (var y = 0; y < h; y += stride) {
-      for (var x = 0; x < w; x += stride) {
-        final idx = y * w + x;
-        final d = depth.depth[idx];
-        // Back-project pixel (x,y) with depth d into a local 3D point.
-        final z = 0.3 + d * 1.2;             // 0.3..1.5m in front of camera
-        final lx = ((x - cx) / f) * z;
-        final ly = -((y - cy) / f) * z;      // flip Y for WebGL
-        // Rotate local frame around world Y and translate to tile center.
-        final wx = centerX + cosT * lx - sinT * (z - 0.9) * tileScale;
-        final wz = centerZ + sinT * lx + cosT * (z - 0.9) * tileScale;
-        final wy = ly * tileScale;
+    // Distribute photos evenly around a full circle. With few photos the
+    // gaps are wide; with many (10+) the tiles start to knit together.
+    final n = math.max(totalImages, 1);
+    final theta = imageIndex * (2 * math.pi / n);
+    final cosT = math.cos(theta), sinT = math.sin(theta);
 
-        final c = idx * 3;
-        out[k++] = wx.toDouble();
-        out[k++] = wy.toDouble();
-        out[k++] = wz.toDouble();
-        out[k++] = depth.rgb[c] / 255.0;
-        out[k++] = depth.rgb[c + 1] / 255.0;
-        out[k++] = depth.rgb[c + 2] / 255.0;
+    if (mode == _LayoutMode.outdoor) {
+      // "Walk around the subject." Tiles face INWARD toward origin.
+      final radius = 0.6; // tighter than before so 4 tiles feel cohesive
+      final tileScale = 0.75;
+      final centerX = radius * cosT;
+      final centerZ = radius * sinT;
+      for (var y = 0; y < h; y += stride) {
+        for (var x = 0; x < w; x += stride) {
+          final idx = y * w + x;
+          final d = depth.depth[idx];
+          final z = 0.1 + d * 3.0;      // deeper relief (0.1..3.1)
+          final lx = ((x - cx) / f) * z;
+          final ly = -((y - cy) / f) * z;
+          final wx = centerX + cosT * lx - sinT * (z - 0.9) * tileScale;
+          final wz = centerZ + sinT * lx + cosT * (z - 0.9) * tileScale;
+          final wy = ly * tileScale;
+
+          final c = idx * 3;
+          out[k++] = wx.toDouble();
+          out[k++] = wy.toDouble();
+          out[k++] = wz.toDouble();
+          out[k++] = depth.rgb[c] / 255.0;
+          out[k++] = depth.rgb[c + 1] / 255.0;
+          out[k++] = depth.rgb[c + 2] / 255.0;
+        }
+      }
+    } else {
+      // Indoor panorama: viewer at origin, tiles wrap around on a cylinder
+      // facing OUTWARD. Depth pushes pixels away from the viewer into the
+      // walls, so rooms render as an inside-out shell.
+      const cylR = 1.0;      // cylinder radius
+      const tileW = 0.85;    // tile half-width along the cylinder tangent
+      const tileH = 0.65;    // tile half-height
+      const depthScale = 0.8;
+      for (var y = 0; y < h; y += stride) {
+        for (var x = 0; x < w; x += stride) {
+          final idx = y * w + x;
+          final d = depth.depth[idx];
+          final uNorm = (x - cx) / cx;       // -1..1
+          final vNorm = (y - cy) / cy;       // -1..1
+          final outward = cylR + d * depthScale;
+          final tangentX = -sinT;
+          final tangentZ = cosT;
+          final wx = outward * cosT + uNorm * tileW * tangentX;
+          final wz = outward * sinT + uNorm * tileW * tangentZ;
+          final wy = -vNorm * tileH;
+
+          final c = idx * 3;
+          out[k++] = wx.toDouble();
+          out[k++] = wy.toDouble();
+          out[k++] = wz.toDouble();
+          out[k++] = depth.rgb[c] / 255.0;
+          out[k++] = depth.rgb[c + 1] / 255.0;
+          out[k++] = depth.rgb[c + 2] / 255.0;
+        }
       }
     }
 
     final f0 = await _pcFile(captureId);
     final sink = f0.openWrite(mode: FileMode.append);
-    sink.add(out.buffer.asUint8List(0, out.lengthInBytes));
+    sink.add(out.buffer.asUint8List(0, k * 4));
     await sink.close();
     _photoCount[captureId] = (_photoCount[captureId] ?? 0) + 1;
   }
@@ -527,7 +689,8 @@ class _LocalStore extends ChangeNotifier {
 
       // Stage 4 — depth + point cloud (the heavy one, runs per photo).
       await _setStage(3);
-      const engine = _DepthEngine();
+      final engine = await _DepthEngine.forCurrent();
+      final layout = CamoState.instance.layoutMode;
       var processed = 0;
       for (final a in photos) {
         final path = a['storage_key'] as String;
@@ -538,10 +701,12 @@ class _LocalStore extends ChangeNotifier {
           captureId: captureId,
           depth: depth,
           imageIndex: processed,
+          totalImages: photos.length,
+          mode: layout,
         );
         processed++;
         // Expose progress in the stage string so the progress chip ticks.
-        job!['stage'] = 'colmap_mvs · $processed/${photos.length}';
+        job!['stage'] = 'colmap_mvs · ${engine.name} · $processed/${photos.length}';
         notifyListeners();
       }
 
@@ -738,6 +903,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   late final TextEditingController _region;
   late final TextEditingController _user;
   late bool _localMode;
+  late _LayoutMode _layoutMode;
 
   @override
   void initState() {
@@ -748,6 +914,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
     _region = TextEditingController(text: s.regionId);
     _user = TextEditingController(text: s.userId);
     _localMode = s.localMode;
+    _layoutMode = s.layoutMode;
   }
 
   @override
@@ -781,7 +948,37 @@ class _SettingsSheetState extends State<_SettingsSheet> {
             value: _localMode,
             onChanged: (v) => setState(() => _localMode = v),
           ),
-          const SizedBox(height: 4),
+          const Divider(height: 16),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 4),
+            child: Text(
+              '촬영 모드',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          SegmentedButton<_LayoutMode>(
+            segments: const [
+              ButtonSegment(
+                value: _LayoutMode.outdoor,
+                icon: Icon(Icons.photo_camera_outlined),
+                label: Text('외부 촬영'),
+              ),
+              ButtonSegment(
+                value: _LayoutMode.indoor,
+                icon: Icon(Icons.meeting_room_outlined),
+                label: Text('실내 파노라마'),
+              ),
+            ],
+            selected: <_LayoutMode>{_layoutMode},
+            onSelectionChanged: (s) => setState(() => _layoutMode = s.first),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 4, bottom: 8),
+            child: Text(
+              '외부: 피사체 주위를 돌며 촬영 · 실내: 가운데 서서 둘러보며 촬영',
+              style: TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+          ),
           TextField(controller: _api, decoration: const InputDecoration(labelText: 'API base URL')),
           const SizedBox(height: 8),
           TextField(controller: _viewer, decoration: const InputDecoration(labelText: 'Viewer base URL')),
@@ -815,6 +1012,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                     s.regionId = _region.text.trim();
                     s.userId = _user.text.trim();
                     s.localMode = _localMode;
+                    s.layoutMode = _layoutMode;
                     await s.save();
                     if (context.mounted) Navigator.pop(context);
                   },
