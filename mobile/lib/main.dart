@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
+import 'package:exif/exif.dart' as exif_pkg;
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
@@ -583,6 +584,72 @@ class _LocalStore extends ChangeNotifier {
   }
 }
 
+// ─── EXIF GPS helpers ────────────────────────────────────────────────────────
+//
+// Reads lat/lon/altitude from an image file's EXIF tags. Works for both
+// gallery picks (the original photo's EXIF is preserved) and on-camera
+// captures via image_picker (Android/iOS both pass full metadata by default).
+// No runtime permission needed — EXIF reading is just file I/O.
+
+class _ExifGps {
+  const _ExifGps({required this.lat, required this.lon, this.altitude, this.heading});
+  final double lat;
+  final double lon;
+  final double? altitude;
+  final double? heading;
+}
+
+double? _dmsToDecimal(dynamic values, String ref) {
+  if (values == null) return null;
+  try {
+    // exif package returns `IfdTags` → `values` as List<Ratio>.
+    final list = (values as dynamic).values as List;
+    if (list.length < 3) return null;
+    double part(dynamic r) =>
+        r is num ? r.toDouble() : (r.numerator as num).toDouble() / (r.denominator as num).toDouble();
+    final d = part(list[0]);
+    final m = part(list[1]);
+    final s = part(list[2]);
+    var dec = d + m / 60.0 + s / 3600.0;
+    final r = ref.toUpperCase();
+    if (r == 'S' || r == 'W') dec = -dec;
+    return dec;
+  } catch (_) {
+    return null;
+  }
+}
+
+double? _ratioToDouble(dynamic values) {
+  if (values == null) return null;
+  try {
+    final list = (values as dynamic).values as List;
+    if (list.isEmpty) return null;
+    final r = list.first;
+    if (r is num) return r.toDouble();
+    return (r.numerator as num).toDouble() / (r.denominator as num).toDouble();
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<_ExifGps?> _readExifGps(File file) async {
+  try {
+    final bytes = await file.readAsBytes();
+    final tags = await exif_pkg.readExifFromBytes(bytes);
+    if (tags.isEmpty) return null;
+    final latRef = tags['GPS GPSLatitudeRef']?.printable ?? 'N';
+    final lonRef = tags['GPS GPSLongitudeRef']?.printable ?? 'E';
+    final lat = _dmsToDecimal(tags['GPS GPSLatitude'], latRef);
+    final lon = _dmsToDecimal(tags['GPS GPSLongitude'], lonRef);
+    if (lat == null || lon == null) return null;
+    final alt = _ratioToDouble(tags['GPS GPSAltitude']);
+    final heading = _ratioToDouble(tags['GPS GPSImgDirection']);
+    return _ExifGps(lat: lat, lon: lon, altitude: alt, heading: heading);
+  } catch (_) {
+    return null;
+  }
+}
+
 // ─── root app ────────────────────────────────────────────────────────────────
 
 class CamoApp extends StatelessWidget {
@@ -932,6 +999,11 @@ class _UploadTabState extends State<_UploadTab> {
           );
         } else {
           final filename = it.file.uri.pathSegments.last;
+          // Pull GPS from EXIF so the server can anchor the reconstruction
+          // on the real globe. Photos without GPS (most indoor shots) just
+          // get nulls — the server still reconstructs, it just won't be
+          // auto-placed on the map.
+          final gps = it.kind == 'photo' ? await _readExifGps(it.file) : null;
           final (storageKey, uploadUrl) = await _api.presign(
             captureId: captureId,
             kind: it.kind,
@@ -945,6 +1017,10 @@ class _UploadTabState extends State<_UploadTab> {
             storageKey: storageKey,
             contentType: it.contentType,
             sizeBytes: await it.file.length(),
+            lat: gps?.lat,
+            lon: gps?.lon,
+            altitude: gps?.altitude,
+            heading: gps?.heading,
             capturedAt: DateTime.now().toUtc(),
           );
         }

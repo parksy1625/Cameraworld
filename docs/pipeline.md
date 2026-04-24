@@ -19,12 +19,30 @@
 - `PIPELINE_GS_ITERATIONS` (기본 30000): 3DGS 학습 반복. 작은 장면은 7000으로도 충분.
 - `matcher` 인자: 영상 중심이면 `sequential`, 사진만 뿌려져 있으면 `exhaustive`.
 
-## 지오참조 (1차)
+## 지오참조 (GPS 자동 배치)
 
-- COLMAP 내부 좌표계는 임의 스케일/원점. `align_to_geo()`는 `image_name,x,y,z` ECEF CSV를
-  `model_aligner`에 전달한다.
-- 1차는 모바일 앱이 첨부한 GPS EXIF를 그대로 CSV로 변환해 사용. 정밀도 ±5~10m 수준.
+- 모바일 앱(`camo`)은 사진마다 **EXIF GPS** 태그를 읽어 업로드 메타데이터에 lat/lon/alt
+  를 실어 보냄. 갤러리에서 선택한 사진도 원본 EXIF가 보존돼 있으면 그대로 사용됨.
+  실내 촬영이라 GPS 위성 신호가 약한 경우엔 EXIF가 비어있어 자동 배치가 안 되고,
+  재구성 자체는 로컬 좌표계로 계속 진행됨.
+- 워커가 자산 행에서 `(lat, lon, altitude)`를 꺼내 `{filename → (lat, lon, alt)}`
+  맵을 만들고, 오케스트레이터는 `pyproj`로 **ECEF 좌표로 환산**해 COLMAP
+  `model_aligner`에 `image_name x y z` CSV로 전달.
+- 최소 3장 이상 GPS가 있을 때만 alignment 시도 (`MIN_GEO_REFERENCES`). 그 미만이면
+  로컬 좌표로 fallback.
+- alignment 성공 시 `Reconstruction` 행의 `center_lat/lon/alt/radius_m`가 실제 지구
+  좌표계 값으로 채워져 Cesium 뷰어가 지구본 위 해당 위치로 `flyTo` + 핀 드롭.
 - 정밀 정합(지상제어점, 시각 장소 인식)은 2차.
+
+## 실내/실외 촬영 모두 지원
+
+- `colmap_sfm.run(..., scene_hint=...)` 에 `"outdoor"` / `"indoor"` / `"auto"` 전달.
+- **outdoor preset**: COLMAP 기본값. 고해상도 풍부한 텍스처 전제.
+- **indoor preset**: SIFT peak threshold 낮추고 edge threshold 올려 **민무늬 벽에서도
+  특징점을 더 많이 추출**. Mapper 초기화 임계도 완화해 짧은 트랙으로도 모델이 시작
+  가능. `max_num_features` 두 배.
+- **auto**: outdoor로 먼저 시도하고 mapper가 모델을 못 만들면 **indoor preset으로 자동
+  재시도** (새 database.db, 새 sparse_retry 디렉토리). 일반 사용자는 이 모드만 쓰면 됨.
 
 ## 워커
 

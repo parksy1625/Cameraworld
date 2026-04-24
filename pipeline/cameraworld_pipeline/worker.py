@@ -68,14 +68,21 @@ def run_reconstruction(capture_id: str, job_id: str) -> None:
         input_dir = workdir / "input"
         input_dir.mkdir()
 
-        assets = _download_assets(capture_id, input_dir)
-        log.info("downloaded %d assets", len(assets))
+        assets, geo_points = _download_assets(capture_id, input_dir)
+        log.info("downloaded %d assets, %d with GPS", len(assets), len(geo_points))
 
         def on_stage(stage: str) -> None:
             with _session() as db:
                 _update_job(db, job_id, stage=stage)
 
-        artifacts = run_pipeline(input_dir, workdir, enable_gs=True, on_stage=on_stage)
+        artifacts = run_pipeline(
+            input_dir,
+            workdir,
+            enable_gs=True,
+            on_stage=on_stage,
+            geo_points=geo_points or None,
+            scene_hint="auto",
+        )
 
         tileset_key, splat_key, pointcloud_key = _upload_artifacts(capture_id, artifacts)
         geo = _compute_geo(artifacts.pointcloud_ply)
@@ -114,24 +121,39 @@ def run_reconstruction(capture_id: str, job_id: str) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _download_assets(capture_id: str, dest_dir: Path) -> list[Path]:
+def _download_assets(
+    capture_id: str, dest_dir: Path
+) -> tuple[list[Path], dict[str, tuple[float, float, float]]]:
+    """Download all assets for a capture and return ``(paths, geo_points)``.
+
+    ``geo_points`` maps the local filename to ``(lat, lon, alt)`` for any
+    asset that has a recorded GPS coordinate. The orchestrator uses this
+    to anchor the reconstruction on the real globe via COLMAP
+    ``model_aligner``.
+    """
     from sqlalchemy import text
 
     settings = get_settings()
     s3 = _s3()
     paths: list[Path] = []
+    geo_points: dict[str, tuple[float, float, float]] = {}
 
     with _session() as db:
         rows = db.execute(
-            text("SELECT storage_key FROM assets WHERE capture_id = :cid ORDER BY created_at"),
+            text(
+                "SELECT storage_key, lat, lon, altitude FROM assets "
+                "WHERE capture_id = :cid ORDER BY created_at"
+            ),
             {"cid": capture_id},
         ).fetchall()
 
-    for (storage_key,) in rows:
+    for storage_key, lat, lon, altitude in rows:
         dst = dest_dir / Path(storage_key).name
         s3.download_file(settings.s3_bucket_captures, storage_key, str(dst))
         paths.append(dst)
-    return paths
+        if lat is not None and lon is not None:
+            geo_points[dst.name] = (float(lat), float(lon), float(altitude or 0.0))
+    return paths, geo_points
 
 
 def _upload_artifacts(capture_id: str, artifacts) -> tuple[str, str | None, str]:
