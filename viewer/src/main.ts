@@ -75,3 +75,12 @@ toggleBtn.addEventListener("click", () => {
   currentSplat.setVisible(splatVisible);
   setStatus(splatVisible ? "splat: on" : "splat: off");
 });
+
+// Auto-load when ?capture=<uuid> is present — lets the camo Flutter app
+// open the viewer in a WebView already pointed at a specific capture.
+const params = new URLSearchParams(window.location.search);
+const auto = params.get("capture");
+if (auto) {
+  captureIdInput.value = auto;
+  loadBtn.click();
+}

@@ -6,7 +6,7 @@
 
 | 디렉토리 | 설명 |
 |----------|------|
-| `mobile/` | Flutter 캡처 앱 (iOS/Android) |
+| `mobile/` | **camo** — Flutter 앱 단일 파일 (탭1: 업로드 · 탭2: 3D 지도) |
 | `backend/` | FastAPI — 업로드·작업·자산 관리 |
 | `pipeline/` | GPU 워커 — COLMAP SfM/MVS + 3D Gaussian Splatting |
 | `viewer/` | CesiumJS 웹 뷰어 (3D Tiles + Gaussian Splat 오버레이) |
