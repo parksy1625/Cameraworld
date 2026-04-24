@@ -24,5 +24,21 @@ make viewer          # 뷰어 (http://localhost:5173)
 
 자세한 내용은 `docs/architecture.md` 참고.
 
+## 모바일 APK 다운로드
+
+`.github/workflows/apk.yml` 가 푸시·수동 트리거 때마다 Android 릴리스
+APK를 빌드합니다. 다운로드 경로 2가지:
+
+1. **GitHub Actions artifact** — GitHub 저장소 → Actions → 해당 workflow run
+   → `camo-release-apk` zip 내려받기 (로그인 필요).
+2. **GitHub Release** — `v0.1.0` 처럼 `v*` 태그를 푸시하면 워크플로가
+   Release에 APK를 자동 첨부합니다. Release 페이지에서 바로 다운로드
+   가능 (로그인 불필요, 폰 브라우저로 접근 가능).
+
+설치:
+- Android 설정에서 "출처를 알 수 없는 앱 설치" 허용
+- 내려받은 apk 탭 → 설치
+- 기본은 **로컬 테스트 모드**라서 백엔드 없이도 업로드 / 3D 뷰까지 동작
+
 ## 라이선스
 MIT (LICENSE 참조)
