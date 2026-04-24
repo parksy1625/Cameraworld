@@ -1,0 +1,35 @@
+name: camo
+description: camo — upload photos/videos, see the 3D map they build.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image_picker: ^1.1.2
+  http: ^1.2.2
+  webview_flutter: ^4.8.0
+  shared_preferences: ^2.3.0
+  path_provider: ^2.1.4
+  path: ^1.9.0
+  image: ^4.2.0
+  exif: ^3.3.0
+  onnxruntime: ^1.4.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/viewer.html
+    # depth_anything_v2_small.onnx is optional — CI downloads it into
+    # assets/models/ before `flutter build`. A .gitkeep marker keeps the
+    # directory declaration valid even when the model file isn't present.
+    - assets/models/

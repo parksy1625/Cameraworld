@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.log
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+ios/Pods/
+ios/Podfile.lock
+android/.gradle/
+android/local.properties
+
+# Env
+.env
+.env.local
+*.local
+
+# Data & artifacts
+data/
+scratch/
+workdir/
+*.ply
+*.splat
+!pipeline/tests/fixtures/*.ply
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

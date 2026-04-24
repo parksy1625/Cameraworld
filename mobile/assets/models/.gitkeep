@@ -1,0 +1,2 @@
+# MiDaS TFLite model is downloaded by the CI workflow at build time.
+# Keep this marker so pubspec's `assets/models/` directory entry always resolves.
