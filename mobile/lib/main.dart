@@ -18,13 +18,22 @@ import 'package:http/http.dart' as http;
 import 'package:exif/exif.dart' as exif_pkg;
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
-import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
+import 'package:onnxruntime/onnxruntime.dart' as ort;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
-void main() => runApp(const CamoApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // ONNX Runtime requires a one-time environment init before any session load.
+  try {
+    ort.OrtEnv.instance.init();
+  } catch (_) {
+    // Safe to ignore — subsequent calls bail gracefully if init fails.
+  }
+  runApp(const CamoApp());
+}
 
 // Spatial arrangement used by the local point-cloud renderer.
 // * outdoor — camera circles the subject; tiles face inward.
@@ -220,7 +229,7 @@ class _Api {
 // to approximate per-pixel depth, normalized to [0, 1]. It's not semantic
 // (a bright but far object will look close), but it produces real 3D points
 // with correct color that accumulate into a coherent cloud as the user
-// adds more photos. Swap in a TFLite MiDaS interpreter later if desired —
+// adds more photos. Swap in any depth-estimation model later — the
 // the rest of the pipeline only cares about the depth map + rgb buffers.
 
 class _DepthMap {
@@ -247,15 +256,19 @@ class _ModelDownloader extends ChangeNotifier {
   static final instance = _ModelDownloader._();
   _ModelDownloader._();
 
-  // Candidate URLs for Depth Anything v2 Base TFLite. First hit wins.
-  // Order matters: user-pinned releases first (most reliable), then
-  // community mirrors. Failures cascade to the next entry.
+  // Candidate URLs for Depth Anything v2 Base ONNX. First hit wins.
+  // Order: user-pinned releases first (most reliable), then community
+  // HuggingFace mirrors. Failures cascade to the next entry.
   static const List<String> baseUrls = [
-    // User-pinned fallback — set this to a release asset in your own repo
-    // for a guaranteed download path. Overrideable via settings later.
-    'https://github.com/parksy1625/Cameraworld/releases/download/models/depth_anything_v2_base.tflite',
-    // HuggingFace litert-community mirror (if the model lands there).
-    'https://huggingface.co/litert-community/depth-anything-v2-base/resolve/main/depth_anything_v2_base.tflite',
+    // User-pinned fallback — upload `depth_anything_v2_base.onnx` to a
+    // release named `models` in your own repo for a guaranteed path.
+    'https://github.com/parksy1625/Cameraworld/releases/download/models/depth_anything_v2_base.onnx',
+    // HuggingFace onnx-community — these repos host exported ONNX weights
+    // for the full Depth Anything v2 lineup.
+    'https://huggingface.co/onnx-community/depth-anything-v2-base-hf/resolve/main/onnx/model.onnx',
+    'https://huggingface.co/onnx-community/depth-anything-v2-base/resolve/main/onnx/model.onnx',
+    // Quantized fallback (smaller, slightly lower quality).
+    'https://huggingface.co/onnx-community/depth-anything-v2-base-hf/resolve/main/onnx/model_quantized.onnx',
   ];
 
   _ModelDownloadState state = _ModelDownloadState.idle;
@@ -266,7 +279,7 @@ class _ModelDownloader extends ChangeNotifier {
     final docs = await getApplicationDocumentsDirectory();
     final dir = Directory(p.join(docs.path, 'models'));
     if (!dir.existsSync()) dir.createSync(recursive: true);
-    return File(p.join(dir.path, 'depth_anything_v2_base.tflite'));
+    return File(p.join(dir.path, 'depth_anything_v2_base.onnx'));
   }
 
   Future<void> ensureDownloaded({bool force = false}) async {
@@ -338,31 +351,24 @@ abstract class _DepthEngine {
   String get name;
 
   /// Pick the best available engine. Priority:
-  ///   1. Depth Anything v2 Base at-runtime file (downloaded on first launch).
-  ///   2. Depth Anything v2 Small bundled asset.
-  ///   3. Legacy MiDaS asset (older builds).
-  ///   4. Classical pseudo-depth — always available.
+  ///   1. Depth Anything v2 Base ONNX at-runtime file (downloaded on first launch).
+  ///   2. Depth Anything v2 Small ONNX bundled asset.
+  ///   3. Classical pseudo-depth — always available.
   /// Always succeeds so callers don't need to null-check.
   static Future<_DepthEngine> forCurrent() async {
     // 1) Downloaded Base
     final baseFile = await _ModelDownloader.baseFile();
     if (baseFile.existsSync() && await baseFile.length() > 1024) {
-      final e = await _TFLiteDepthEngine.fromFile(baseFile, label: 'depth-anything-v2-base');
+      final e = await _OnnxDepthEngine.fromFile(baseFile, label: 'depth-anything-v2-base');
       if (e != null) return e;
     }
     // 2) Bundled Small
-    final small = await _TFLiteDepthEngine.fromAsset(
-      'assets/models/depth_anything_v2_small.tflite',
+    final small = await _OnnxDepthEngine.fromAsset(
+      'assets/models/depth_anything_v2_small.onnx',
       label: 'depth-anything-v2-small',
     );
     if (small != null) return small;
-    // 3) Legacy MiDaS
-    final midas = await _TFLiteDepthEngine.fromAsset(
-      'assets/models/midas.tflite',
-      label: 'midas',
-    );
-    if (midas != null) return midas;
-    // 4) Classical fallback
+    // 3) Classical fallback
     return const _ClassicalEngine();
   }
 }
@@ -383,138 +389,95 @@ class _DepthJob {
   final int target;
 }
 
-// ── TFLite depth engine (Depth Anything v2 / MiDaS / etc.) ─────────────────
-// Loads any single-channel-depth TFLite model. Handles variable input sizes
-// (256/308/518/...), applies ImageNet normalization used by Depth Anything
-// v2, and normalizes the output to [0,1] "near=1" convention used by the
-// rest of the pipeline.
-//
-// Interpreter isn't thread-safe so inference runs on the main isolate; for
-// our scale (a handful of photos per submit) that's fine.
-class _TFLiteDepthEngine implements _DepthEngine {
-  _TFLiteDepthEngine._(this._interpreter, this._inDim, this.name);
-  final tfl.Interpreter _interpreter;
+// ── ONNX depth engine (Depth Anything v2, etc.) ───────────────────────────
+// Loads any ONNX depth model whose input is NCHW RGB and output is a single
+// channel depth map. The app ships with Depth Anything v2 Small and the
+// runtime downloader fetches Base at first launch. ONNX (as opposed to
+// TFLite) lets us use the widely-available onnx-community conversions of
+// these models without fragile format juggling.
+class _OnnxDepthEngine implements _DepthEngine {
+  _OnnxDepthEngine._(this._session, this._inDim, this.name);
+  final ort.OrtSession _session;
   final int _inDim;
   @override
   final String name;
 
-  static Future<_TFLiteDepthEngine?> fromAsset(String asset, {required String label}) async {
+  static Future<_OnnxDepthEngine?> fromAsset(String asset, {required String label}) async {
     try {
-      final interp = await tfl.Interpreter.fromAsset(asset);
-      return _make(interp, label);
+      final raw = await rootBundle.load(asset);
+      return _make(raw.buffer.asUint8List(), label);
     } catch (e) {
       debugPrint('camo: $label asset not loadable ($e)');
       return null;
     }
   }
 
-  static Future<_TFLiteDepthEngine?> fromFile(File file, {required String label}) async {
+  static Future<_OnnxDepthEngine?> fromFile(File file, {required String label}) async {
     try {
-      final interp = tfl.Interpreter.fromFile(file);
-      return _make(interp, label);
+      final bytes = await file.readAsBytes();
+      return _make(bytes, label);
     } catch (e) {
       debugPrint('camo: $label file not loadable ($e)');
       return null;
     }
   }
 
-  static _TFLiteDepthEngine _make(tfl.Interpreter interp, String label) {
-    final shape = interp.getInputTensor(0).shape;
-    // Accept [1, D, D, 3] (NHWC) or [1, 3, D, D] (NCHW, Depth Anything).
-    int dim;
-    if (shape.length == 4 && shape[1] == 3) {
-      dim = shape[2];
-    } else if (shape.length >= 3) {
-      dim = shape[1];
-    } else {
-      dim = 256;
+  static _OnnxDepthEngine? _make(Uint8List bytes, String label) {
+    try {
+      final opts = ort.OrtSessionOptions();
+      final session = ort.OrtSession.fromBuffer(bytes, opts);
+      // Depth Anything v2 uses 518 as the canonical input; ONNX models
+      // usually have dynamic H/W. We pick 518 to match the training size
+      // for best quality. Smaller models (e.g. 308) still work — resize
+      // is agnostic.
+      const dim = 518;
+      debugPrint('camo: $label ready (onnx, dim=$dim)');
+      return _OnnxDepthEngine._(session, dim, label);
+    } catch (e) {
+      debugPrint('camo: $label ort session create failed: $e');
+      return null;
     }
-    debugPrint('camo: $label ready (input ${shape.join('x')}, dim=$dim)');
-    return _TFLiteDepthEngine._(interp, dim, label);
   }
 
   @override
   Future<_DepthMap?> analyzeFile(String path, {int target = 128}) async {
+    ort.OrtValueTensor? inputOrt;
+    ort.OrtRunOptions? runOpts;
+    List<ort.OrtValue?>? outputs;
     try {
       final bytes = await File(path).readAsBytes();
       img.Image? src = img.decodeImage(bytes);
       if (src == null) return null;
       src = img.bakeOrientation(src);
 
-      // Input tensor — try NHWC layout first (most common). If interpreter
-      // expects NCHW we re-layout below.
       final D = _inDim;
       final resized = img.copyResize(src, width: D, height: D,
           interpolation: img.Interpolation.linear);
-      final shape = _interpreter.getInputTensor(0).shape;
-      final isNchw = shape.length == 4 && shape[1] == 3;
 
-      // ImageNet normalization — matches Depth Anything v2 training.
+      // NCHW + ImageNet normalization (matches Depth Anything v2).
       const mean = [0.485, 0.456, 0.406];
       const stdv = [0.229, 0.224, 0.225];
       final input = Float32List(1 * 3 * D * D);
       for (var y = 0; y < D; y++) {
         for (var x = 0; x < D; x++) {
           final px = resized.getPixel(x, y);
-          final r = (px.r.toDouble() / 255.0 - mean[0]) / stdv[0];
-          final g = (px.g.toDouble() / 255.0 - mean[1]) / stdv[1];
-          final b = (px.b.toDouble() / 255.0 - mean[2]) / stdv[2];
-          if (isNchw) {
-            input[0 * D * D + y * D + x] = r;
-            input[1 * D * D + y * D + x] = g;
-            input[2 * D * D + y * D + x] = b;
-          } else {
-            final o = (y * D + x) * 3;
-            input[o] = r;
-            input[o + 1] = g;
-            input[o + 2] = b;
-          }
+          input[0 * D * D + y * D + x] = (px.r.toDouble() / 255.0 - mean[0]) / stdv[0];
+          input[1 * D * D + y * D + x] = (px.g.toDouble() / 255.0 - mean[1]) / stdv[1];
+          input[2 * D * D + y * D + x] = (px.b.toDouble() / 255.0 - mean[2]) / stdv[2];
         }
       }
-      final inputTensor = isNchw ? input.reshape([1, 3, D, D]) : input.reshape([1, D, D, 3]);
 
-      // Output shape can be [1, D, D], [1, 1, D, D], or [1, D*D]. Build a
-      // buffer matching exactly what the model declares so tflite doesn't
-      // throw on mismatched ranks.
-      final outShape = _interpreter.getOutputTensor(0).shape;
-      final outFlat = Float32List(outShape.fold<int>(1, (a, b) => a * b));
-      dynamic outputTensor;
-      if (outShape.length == 4) {
-        outputTensor = List.generate(
-          outShape[0],
-          (_) => List.generate(outShape[1],
-              (_) => List.generate(outShape[2], (_) => List.filled(outShape[3], 0.0))),
-        );
-      } else if (outShape.length == 3) {
-        outputTensor = List.generate(outShape[0],
-            (_) => List.generate(outShape[1], (_) => List.filled(outShape[2], 0.0)));
-      } else {
-        outputTensor = [outFlat];
-      }
-      _interpreter.run(inputTensor, outputTensor);
+      inputOrt = ort.OrtValueTensor.createTensorWithDataList(input, [1, 3, D, D]);
+      final inputName = _session.inputNames.isNotEmpty ? _session.inputNames.first : 'pixel_values';
+      runOpts = ort.OrtRunOptions();
+      outputs = _session.run(runOpts, {inputName: inputOrt});
 
-      // Flatten output to a D×D float matrix, regardless of layout.
+      // Output is [1, 1, D, D] or [1, D, D] — flatten into DxD floats.
       final flat = Float32List(D * D);
-      if (outputTensor is List && outputTensor.isNotEmpty) {
-        void walk(dynamic node, List<int> path) {
-          if (node is List) {
-            for (var i = 0; i < node.length; i++) {
-              walk(node[i], [...path, i]);
-            }
-          } else if (node is num) {
-            // Try to map the leaf into a D×D index.
-            final leafIdx = path.sublist(path.length - 2);
-            if (leafIdx.length == 2) {
-              final y = leafIdx[0], x = leafIdx[1];
-              if (y < D && x < D) flat[y * D + x] = node.toDouble();
-            }
-          }
-        }
-        walk(outputTensor, <int>[]);
-      }
+      _flattenTo(outputs.first?.value, flat, D);
 
       double lo = double.infinity, hi = -double.infinity;
-      for (var v in flat) {
+      for (final v in flat) {
         if (v < lo) lo = v;
         if (v > hi) hi = v;
       }
@@ -542,6 +505,28 @@ class _TFLiteDepthEngine implements _DepthEngine {
     } catch (e, st) {
       debugPrint('camo: $name inference failed: $e\n$st');
       return null;
+    } finally {
+      inputOrt?.release();
+      runOpts?.release();
+      outputs?.forEach((o) => o?.release());
+    }
+  }
+
+  /// ONNX Runtime returns nested Lists for multi-dim outputs. Walk them and
+  /// write any leaf we find into a D×D grid, using the last two dims as
+  /// the (y, x) index.
+  static void _flattenTo(dynamic node, Float32List flat, int D, [List<int>? path]) {
+    path ??= <int>[];
+    if (node is List) {
+      for (var i = 0; i < node.length; i++) {
+        _flattenTo(node[i], flat, D, [...path, i]);
+      }
+    } else if (node is num) {
+      if (path.length >= 2) {
+        final y = path[path.length - 2];
+        final x = path[path.length - 1];
+        if (y < D && x < D) flat[y * D + x] = node.toDouble();
+      }
     }
   }
 }

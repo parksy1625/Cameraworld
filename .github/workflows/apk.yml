@@ -57,26 +57,27 @@ jobs:
         working-directory: mobile
         run: flutter pub get
 
-      # Depth Anything v2 Small TFLite → real semantic depth in local mode.
+      # Depth Anything v2 Small ONNX → real semantic depth in local mode.
       # Bundled into the APK when a mirror resolves. Misses are tolerated:
       # the app falls back to classical pseudo-depth, and Base is fetched at
       # runtime on first launch regardless.
-      - name: Download Depth Anything v2 Small TFLite
+      - name: Download Depth Anything v2 Small ONNX
         working-directory: mobile
         continue-on-error: true
         run: |
           set -x
           mkdir -p assets/models
-          dst="assets/models/depth_anything_v2_small.tflite"
+          dst="assets/models/depth_anything_v2_small.onnx"
           urls=(
-            "https://github.com/parksy1625/Cameraworld/releases/download/models/depth_anything_v2_small.tflite"
-            "https://huggingface.co/litert-community/depth-anything-v2-small/resolve/main/depth_anything_v2_small.tflite"
-            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/depth_anything_v2_small.tflite"
-            "https://github.com/PINTO0309/PINTO_model_zoo/releases/download/TFLite/depth_anything_v2_small_fp16.tflite"
+            "https://github.com/parksy1625/Cameraworld/releases/download/models/depth_anything_v2_small.onnx"
+            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
+            "https://huggingface.co/onnx-community/depth-anything-v2-small-hf/resolve/main/onnx/model.onnx"
+            "https://huggingface.co/onnx-community/depth-anything-v2-small-hf/resolve/main/onnx/model_quantized.onnx"
+            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx"
           )
           for u in "${urls[@]}"; do
             echo "trying: $u"
-            if curl -fL --retry 2 --max-time 120 -o "$dst" "$u"; then
+            if curl -fL --retry 2 --max-time 180 -o "$dst" "$u"; then
               sz=$(stat -c %s "$dst" 2>/dev/null || wc -c <"$dst")
               if [ "$sz" -gt 1048576 ]; then   # must be > 1MB to be real
                 ls -la "$dst" && break
