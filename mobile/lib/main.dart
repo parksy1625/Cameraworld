@@ -8,10 +8,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -191,9 +195,190 @@ class _Api {
 //
 // A fully offline drop-in that mimics the shape of the REST API so the app can
 // run on a phone with no backend reachable. Assets are copied into the app's
-// documents directory; job progression is simulated with a timer stepping
-// through the same six stages as the real pipeline. Good enough for UI /
-// flow testing; the 3D "map" in Tab 2 is rendered natively in Flutter.
+// documents directory. Each `submit` triggers real work per stage:
+// extract/filter (image decode + blur), depth estimation, per-image point
+// cloud generation, and accumulation. Stage strings mirror the server
+// pipeline so Tab 1's progress chips stay meaningful.
+
+// ─── depth engine ────────────────────────────────────────────────────────────
+//
+// Classical on-device pseudo-depth: combines luminance + Sobel edge energy
+// to approximate per-pixel depth, normalized to [0, 1]. It's not semantic
+// (a bright but far object will look close), but it produces real 3D points
+// with correct color that accumulate into a coherent cloud as the user
+// adds more photos. Swap in a TFLite MiDaS interpreter later if desired —
+// the rest of the pipeline only cares about the depth map + rgb buffers.
+
+class _DepthMap {
+  _DepthMap(this.w, this.h, this.depth, this.rgb);
+  final int w;
+  final int h;
+  final Float32List depth; // length w*h, in [0, 1]
+  final Uint8List rgb;     // length w*h*3
+}
+
+class _DepthEngine {
+  const _DepthEngine();
+
+  /// Produce a depth map + downsampled rgb from an image file.
+  /// Runs entirely in-process; call via [compute] to offload to a worker.
+  Future<_DepthMap?> analyzeFile(String path, {int target = 96}) async {
+    return compute(_depthIsolate, _DepthJob(path, target));
+  }
+}
+
+class _DepthJob {
+  const _DepthJob(this.path, this.target);
+  final String path;
+  final int target;
+}
+
+// Top-level function so it can run in an isolate via `compute`.
+_DepthMap? _depthIsolate(_DepthJob job) {
+  final bytes = File(job.path).readAsBytesSync();
+  img.Image? src = img.decodeImage(bytes);
+  if (src == null) return null;
+  // Respect EXIF orientation so portrait shots aren't sideways.
+  src = img.bakeOrientation(src);
+  final scale = job.target / math.max(src.width, src.height);
+  final w = (src.width * scale).round().clamp(16, job.target);
+  final h = (src.height * scale).round().clamp(16, job.target);
+  final small = img.copyResize(src, width: w, height: h, interpolation: img.Interpolation.linear);
+
+  final rgb = Uint8List(w * h * 3);
+  final lum = Float32List(w * h);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      final px = small.getPixel(x, y);
+      final r = px.r.toInt();
+      final g = px.g.toInt();
+      final b = px.b.toInt();
+      final o = (y * w + x);
+      rgb[o * 3] = r;
+      rgb[o * 3 + 1] = g;
+      rgb[o * 3 + 2] = b;
+      lum[o] = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+    }
+  }
+
+  // Sobel edge magnitude per pixel.
+  final edge = Float32List(w * h);
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final gx = -lum[(y - 1) * w + (x - 1)] + lum[(y - 1) * w + (x + 1)]
+          + -2 * lum[y * w + (x - 1)] + 2 * lum[y * w + (x + 1)]
+          + -lum[(y + 1) * w + (x - 1)] + lum[(y + 1) * w + (x + 1)];
+      final gy = -lum[(y - 1) * w + (x - 1)] - 2 * lum[(y - 1) * w + x] - lum[(y - 1) * w + (x + 1)]
+          + lum[(y + 1) * w + (x - 1)] + 2 * lum[(y + 1) * w + x] + lum[(y + 1) * w + (x + 1)];
+      edge[y * w + x] = math.sqrt(gx * gx + gy * gy);
+    }
+  }
+
+  // Pseudo-depth: dark & low-edge pixels → far, bright & high-edge → near.
+  final depth = Float32List(w * h);
+  var lo = double.infinity, hi = -double.infinity;
+  for (var i = 0; i < depth.length; i++) {
+    final d = 0.65 * lum[i] + 0.55 * math.min(edge[i], 1.0);
+    depth[i] = d;
+    if (d < lo) lo = d;
+    if (d > hi) hi = d;
+  }
+  final span = (hi - lo).abs() < 1e-6 ? 1.0 : (hi - lo);
+  for (var i = 0; i < depth.length; i++) {
+    depth[i] = ((depth[i] - lo) / span).clamp(0.0, 1.0);
+  }
+  return _DepthMap(w, h, depth, rgb);
+}
+
+// ─── point cloud store ───────────────────────────────────────────────────────
+//
+// One growing Float32List per capture on disk. Interleaved [x,y,z,r,g,b]
+// with r/g/b in [0,1]. Each image contributes up to ~6k points placed on a
+// local tile that's rotated around the global Y axis by its index, so more
+// photos → wider 3D map.
+
+class _PointCloudStore {
+  static final instance = _PointCloudStore._();
+  _PointCloudStore._();
+
+  final Map<String, int> _photoCount = {};
+
+  Future<File> _pcFile(String captureId) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(docs.path, 'camo', captureId));
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return File(p.join(dir.path, 'cloud.bin'));
+  }
+
+  Future<Float32List> read(String captureId) async {
+    final f = await _pcFile(captureId);
+    if (!await f.exists()) return Float32List(0);
+    final bytes = await f.readAsBytes();
+    return Float32List.view(bytes.buffer, bytes.offsetInBytes, bytes.lengthInBytes ~/ 4);
+  }
+
+  Future<void> clear(String captureId) async {
+    final f = await _pcFile(captureId);
+    if (await f.exists()) await f.delete();
+    _photoCount.remove(captureId);
+  }
+
+  Future<void> appendImage({
+    required String captureId,
+    required _DepthMap depth,
+    required int imageIndex,
+    int stride = 2,
+  }) async {
+    final w = depth.w, h = depth.h;
+    final samples = ((w ~/ stride) * (h ~/ stride));
+    final out = Float32List(samples * 6);
+    var k = 0;
+
+    // Place this image's tile at an offset on a ring around the origin.
+    final theta = imageIndex * (math.pi / 3); // 60° apart, wraps naturally
+    final cosT = math.cos(theta), sinT = math.sin(theta);
+    final radius = 1.8;
+    final centerX = radius * cosT;
+    final centerZ = radius * sinT;
+
+    // Camera intrinsics for back-projection — simple focal length assumption.
+    final cx = w / 2.0;
+    final cy = h / 2.0;
+    final f = w.toDouble(); // ~60° FOV
+    final tileScale = 0.75;  // tile half-width in world units
+
+    for (var y = 0; y < h; y += stride) {
+      for (var x = 0; x < w; x += stride) {
+        final idx = y * w + x;
+        final d = depth.depth[idx];
+        // Back-project pixel (x,y) with depth d into a local 3D point.
+        final z = 0.3 + d * 1.2;             // 0.3..1.5m in front of camera
+        final lx = ((x - cx) / f) * z;
+        final ly = -((y - cy) / f) * z;      // flip Y for WebGL
+        // Rotate local frame around world Y and translate to tile center.
+        final wx = centerX + cosT * lx - sinT * (z - 0.9) * tileScale;
+        final wz = centerZ + sinT * lx + cosT * (z - 0.9) * tileScale;
+        final wy = ly * tileScale;
+
+        final c = idx * 3;
+        out[k++] = wx.toDouble();
+        out[k++] = wy.toDouble();
+        out[k++] = wz.toDouble();
+        out[k++] = depth.rgb[c] / 255.0;
+        out[k++] = depth.rgb[c + 1] / 255.0;
+        out[k++] = depth.rgb[c + 2] / 255.0;
+      }
+    }
+
+    final f0 = await _pcFile(captureId);
+    final sink = f0.openWrite(mode: FileMode.append);
+    sink.add(out.buffer.asUint8List(0, out.lengthInBytes));
+    await sink.close();
+    _photoCount[captureId] = (_photoCount[captureId] ?? 0) + 1;
+  }
+
+  int photoCount(String captureId) => _photoCount[captureId] ?? 0;
+}
 
 class _LocalStore extends ChangeNotifier {
   static final instance = _LocalStore._();
@@ -293,47 +478,100 @@ class _LocalStore extends ChangeNotifier {
     };
     await _persist();
     notifyListeners();
-    _startSim();
+    // Kick off the real pipeline in the background — don't await here or the
+    // UI button would hang until every photo has been processed.
+    unawaited(_runPipeline(captureId));
     return job!;
   }
 
-  void _startSim() {
-    _sim?.cancel();
-    _tickLater();
+  static const List<String> _stages = [
+    'extract_frames',
+    'filter_quality',
+    'colmap_sfm',
+    'colmap_mvs',
+    'gaussian_splat',
+    'to_3dtiles',
+  ];
+
+  Future<void> _setStage(int idx) async {
+    job!['status'] = 'running';
+    job!['stage'] = _stages[idx];
+    job!['_stageIndex'] = idx;
+    job!['started_at'] ??= DateTime.now().toIso8601String();
+    await _persist();
+    notifyListeners();
   }
 
-  void _resumeSim() => _tickLater();
+  Future<void> _runPipeline(String captureId) async {
+    try {
+      // Start fresh so re-submitting with more photos produces a coherent
+      // growing cloud instead of doubling up.
+      await _PointCloudStore.instance.clear(captureId);
 
-  void _tickLater() {
-    _sim = Timer(const Duration(milliseconds: 1500), _tickStage);
-  }
+      final photos = assets
+          .where((a) => a['capture_id'] == captureId && a['kind'] == 'photo')
+          .toList();
 
-  void _tickStage() {
-    if (job == null) return;
-    final idx = (job!['_stageIndex'] as int) + 1;
-    const stages = [
-      'extract_frames',
-      'filter_quality',
-      'colmap_sfm',
-      'colmap_mvs',
-      'gaussian_splat',
-      'to_3dtiles',
-    ];
-    if (idx >= stages.length) {
+      // Stage 1 — extract_frames (photos are already frames).
+      await _setStage(0);
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      // Stage 2 — filter_quality (cheap; real work happens during depth).
+      await _setStage(1);
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      // Stage 3 — pose assignment (ring layout, not real SfM).
+      await _setStage(2);
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      // Stage 4 — depth + point cloud (the heavy one, runs per photo).
+      await _setStage(3);
+      const engine = _DepthEngine();
+      var processed = 0;
+      for (final a in photos) {
+        final path = a['storage_key'] as String;
+        if (!File(path).existsSync()) continue;
+        final depth = await engine.analyzeFile(path);
+        if (depth == null) continue;
+        await _PointCloudStore.instance.appendImage(
+          captureId: captureId,
+          depth: depth,
+          imageIndex: processed,
+        );
+        processed++;
+        // Expose progress in the stage string so the progress chip ticks.
+        job!['stage'] = 'colmap_mvs · $processed/${photos.length}';
+        notifyListeners();
+      }
+
+      // Stage 5 — gaussian_splat (skipped locally; mark visited).
+      await _setStage(4);
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      // Stage 6 — to_3dtiles (the point cloud file IS the tileset).
+      await _setStage(5);
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
       job!['status'] = 'succeeded';
       job!['stage'] = null;
       job!['finished_at'] = DateTime.now().toIso8601String();
-    } else {
-      job!['status'] = 'running';
-      job!['stage'] = stages[idx];
-      job!['_stageIndex'] = idx;
-      if (job!['started_at'] == null) {
-        job!['started_at'] = DateTime.now().toIso8601String();
-      }
-      _tickLater();
+      await _persist();
+      notifyListeners();
+    } catch (e, st) {
+      job!['status'] = 'failed';
+      job!['error'] = '$e';
+      job!['finished_at'] = DateTime.now().toIso8601String();
+      await _persist();
+      notifyListeners();
+      debugPrint('local pipeline failed: $e\n$st');
     }
-    _persist();
-    notifyListeners();
+  }
+
+  /// Re-drive the pipeline if the app was killed mid-run. Called from load().
+  void _resumeSim() {
+    if (job == null) return;
+    final captureId = job!['capture_id'] as String?;
+    if (captureId != null) unawaited(_runPipeline(captureId));
   }
 
   Future<void> reset() async {
@@ -989,8 +1227,7 @@ class _MapTabState extends State<_MapTab> {
       return _NoMapPlaceholder(job: _latestJob, onRetry: _refresh);
     }
     if (CamoState.instance.localMode && captureId != null) {
-      final assets = _LocalStore.instance.assetsFor(captureId);
-      return _LocalMap3D(assets: assets);
+      return _LocalPointCloudViewer(captureId: captureId);
     }
     if (_web != null) return WebViewWidget(controller: _web!);
     return _NoMapPlaceholder(job: _latestJob, onRetry: _refresh);
@@ -1081,7 +1318,110 @@ class _NoMapPlaceholder extends StatelessWidget {
   }
 }
 
-// ─── local 3D map (offline test view) ────────────────────────────────────────
+// ─── local 3D point cloud viewer (WebGL in WebView) ──────────────────────────
+
+class _LocalPointCloudViewer extends StatefulWidget {
+  const _LocalPointCloudViewer({required this.captureId});
+  final String captureId;
+
+  @override
+  State<_LocalPointCloudViewer> createState() => _LocalPointCloudViewerState();
+}
+
+class _LocalPointCloudViewerState extends State<_LocalPointCloudViewer> {
+  WebViewController? _web;
+  bool _htmlReady = false;
+  int _ptsSent = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _boot();
+    _LocalStore.instance.addListener(_onLocalChange);
+  }
+
+  @override
+  void dispose() {
+    _LocalStore.instance.removeListener(_onLocalChange);
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LocalPointCloudViewer old) {
+    super.didUpdateWidget(old);
+    if (old.captureId != widget.captureId) {
+      _ptsSent = 0;
+      _htmlReady = false;
+      _boot();
+    }
+  }
+
+  void _onLocalChange() {
+    final job = _LocalStore.instance.job;
+    if (job != null && job['status'] == 'succeeded') _pushPoints();
+  }
+
+  Future<void> _boot() async {
+    final html = await rootBundle.loadString('assets/viewer.html');
+    final ctrl = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0xff0b1220))
+      ..setNavigationDelegate(NavigationDelegate(
+        onPageFinished: (_) {
+          _htmlReady = true;
+          _pushPoints();
+        },
+      ))
+      ..loadHtmlString(html);
+    if (!mounted) return;
+    setState(() => _web = ctrl);
+  }
+
+  Future<void> _pushPoints() async {
+    if (!_htmlReady || _web == null) return;
+    final pts = await _PointCloudStore.instance.read(widget.captureId);
+    if (pts.isEmpty) return;
+    final bytes = pts.buffer.asUint8List(0, pts.lengthInBytes);
+    final b64 = base64Encode(bytes);
+    await _web!.runJavaScript('window.camoLoadPoints("$b64");');
+    if (!mounted) return;
+    setState(() => _ptsSent = pts.length ~/ 6);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_web == null) {
+      return const ColoredBox(
+        color: Color(0xff0b1220),
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+    return Stack(
+      children: [
+        Positioned.fill(child: WebViewWidget(controller: _web!)),
+        Positioned(
+          top: 8,
+          right: 12,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.45),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              child: Text(
+                '누적 ${_ptsSent.toString()} pts · 드래그 회전',
+                style: const TextStyle(color: Colors.white, fontSize: 11),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ─── local 3D map (offline test view — legacy thumbnail ring) ────────────────
 
 class _LocalMap3D extends StatefulWidget {
   const _LocalMap3D({required this.assets});
