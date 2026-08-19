@@ -5,6 +5,9 @@ on:
     branches:
       - main
       - signal-relay-v1.5
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
