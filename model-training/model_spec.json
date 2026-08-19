@@ -1,0 +1,10 @@
+{
+  "name": "signal-relay-detector",
+  "task": "object_detection",
+  "format": "onnx",
+  "input": {"name": "images", "dtype": "float32", "shape": [1,3,640,640], "layout": "NCHW", "color": "RGB", "range": [0.0,1.0], "resize": "letterbox_black"},
+  "output": {"accepted_shapes": ["[1,4+nc,N]", "[1,N,4+nc]"], "box": "cxcywh", "class_scores_start": 4, "nms_in_model": false},
+  "defaults": {"confidence": 0.35, "iou": 0.45, "max_detections": 30},
+  "class_count": 20,
+  "notes": ["사진에서 직접 보이는 외관 상태만 검출", "전기적 정상/고장 판정 클래스는 넣지 않음", "앱에서 NMS 수행"]
+}
