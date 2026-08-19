@@ -1,0 +1,26 @@
+# Signal Relay V1.5 - Ultralytics YOLO detection dataset
+path: ./signal_dataset
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: 신호기
+  1: 선로전환기
+  2: ATS지상자
+  3: 발리스
+  4: 궤도회로
+  5: 임피던스본드
+  6: 본드선
+  7: 케이블
+  8: 케이블트로프
+  9: 신호기구함
+  10: 전원설비
+  11: 접지
+  12: 표지류
+  13: 파손
+  14: 이탈
+  15: 케이블노출
+  16: 부식
+  17: 잡초
+  18: 침수
+  19: 이물질
