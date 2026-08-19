@@ -19,3 +19,5 @@
 GitHub Actions의 `Build Signal Relay APK` 워크플로가 `main` 브랜치 push 시 Debug APK를 자동 빌드합니다.
 
 산출물: `SignalRelay-v1.5-debug-apk`
+
+Build trigger: 2026-08-20
