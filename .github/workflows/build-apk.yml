@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - signal-relay-v1.5
+      - signal-relay-v1.6
   pull_request:
     branches:
       - main
@@ -44,7 +44,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SignalRelay-v1.5-debug-apk
+          name: SignalRelay-v1.6-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
