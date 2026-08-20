@@ -10,8 +10,8 @@ android {
         applicationId 'com.signalrelay.app'
         minSdk 26
         targetSdk 35
-        versionCode 15
-        versionName '1.5.0'
+        versionCode 16
+        versionName '1.6.0'
     }
 
     buildTypes {
@@ -23,6 +23,6 @@ android {
 }
 
 dependencies {
-    // ONNX Runtime native Android runtime is packaged into the APK at build time.
+    // AI remains fully on-device. Networking is used only for record/photo synchronization.
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.24.1'
 }
